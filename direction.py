@@ -1,15 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-文件名: DeepLOB_Ultimate.py
-版本: Ultimate (Cross-Sectional + Deep Capacity + Long Context)
-架构: Dual-Input Inception + SE + Deep Transformer (6-Layers)
-功能: 
-    1. [方向4] 跨品种融合: 同时读取 159920 和 513130，计算相对强弱
-    2. [方向1] 超长视野: Lookback = 120 (6分钟历史)
-    3. [方向2] 扩容模型: 256维特征空间, 6层 Transformer, 16头注意力
-    4. 标签: 依然保留最强的 "三势垒法" (Triple Barrier)
-"""
-
 import pandas as pd
 import numpy as np
 import torch
