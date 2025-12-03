@@ -219,15 +219,19 @@ class Direction(nn.Module):
         return self.fc(x.mean(dim=0))
 
 class HybridMinerNet(nn.Module):
-    def __init__(self, input_dim, d_model=128, n_factors=128):
+    def __init__(self, input_dim, d_model=128, num_layers=3, n_factors=128):
         super(HybridMinerNet, self).__init__()
         self.alpha_layer = AlphaLayer(input_dim)
         self.tcn = TemporalBlock(input_dim*3, d_model, kernel_size=3, dilation=1)
         self.pos_encoder = SinusoidalPosEncoding(d_model)
+        
+        # 使用传入的 d_model 和 num_layers
         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, dim_feedforward=256, dropout=0.1)
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=3)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        
         self.factor_head = nn.Sequential(nn.Linear(d_model, 256), nn.GELU(), nn.Linear(256, n_factors), nn.Tanh())
         self.predictor = nn.Linear(n_factors, 1)
+
     def forward(self, x):
         x = self.alpha_layer(x)
         x = x.permute(0, 2, 1)
