@@ -28,8 +28,12 @@ CONFIG = {
     'MAX_LOOKBACK': 120,     
     'HORIZON': 20,           
     'RESAMPLE_FREQ': '3s',   
-    'TRAIN_EPOCHS': 30,      
+    'TRAIN_EPOCHS': 30,      # 初始训练轮数
+    'FINETUNE_EPOCHS': 10,   # 微调训练轮数
     'BARRIER_THRESHOLD': 0.002, 
+    
+    # --- 滚动窗口 ---
+    'ROLLING_WINDOW_SIZE': 60, # 只使用最近N天的数据
     
     # --- 输出 ---
     'ARTIFACT_NAME': 'FACTOR_STRATEGY_ARTIFACT.pth',
@@ -224,11 +228,8 @@ class HybridMinerNet(nn.Module):
         self.alpha_layer = AlphaLayer(input_dim)
         self.tcn = TemporalBlock(input_dim*3, d_model, kernel_size=3, dilation=1)
         self.pos_encoder = SinusoidalPosEncoding(d_model)
-        
-        # 使用传入的 d_model 和 num_layers
         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, dim_feedforward=256, dropout=0.1)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        
         self.factor_head = nn.Sequential(nn.Linear(d_model, 256), nn.GELU(), nn.Linear(256, n_factors), nn.Tanh())
         self.predictor = nn.Linear(n_factors, 1)
 
@@ -309,7 +310,7 @@ class ManualFactorGenerator:
         return res.fillna(0)
 
 # ==============================================================================
-# 4. 深度模型管理器 (支持多日列表输入)
+# 4. 深度模型管理器 (支持多日、滚动微调)
 # ==============================================================================
 class DeepModelManager:
     def __init__(self, name, model_cls, input_cols, lookback, n_factors=128, is_cls=False):
@@ -322,33 +323,42 @@ class DeepModelManager:
         self.trained_model = None
         self.trained_scaler = None
 
+    def load_checkpoint(self, path, device):
+        """加载预训练权重（热启动的关键）"""
+        if os.path.exists(path):
+            try:
+                checkpoint = torch.load(path, map_location=device)
+                model_key = f"{self.name}_state_dict"
+                if model_key in checkpoint['models']:
+                    print(f"   -> 发现预训练权重: {model_key}")
+                    return checkpoint['models'][model_key]
+            except Exception as e:
+                print(f"   -> 读取检查点失败: {e}")
+        return None
+
     def _prepare_single_day(self, df, fit=False, scaler=None):
         """对单日数据进行标准化和滑窗切片，避免跨日污染"""
         raw = df[self.input_cols].values
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # 标准化
-        if fit:
-            # 如果是 Fit 阶段，先只 Transform (Fit 在外部统一做)
-            # 或者这里假设 scaler 已经 ready
+        if scaler:
             data = scaler.transform(raw)
         else:
-            data = scaler.transform(raw)
+            data = raw
             
         # 滑窗切片
         X_list = []
-        # 注意: 每一天前 lookback 个数据是无效的，丢弃
         for i in range(self.lookback, len(data)):
             X_list.append(data[i-self.lookback : i])
         
         if len(X_list) == 0: return None, None
         X = np.array(X_list)
         
-        # 生成标签
+        # 生成标签 (仅 Training 阶段需要)
         y = None
         if fit:
             if self.is_cls:
-                # 三势垒 (锁定 0.002)
+                # 三势垒
                 prices = df['mid_price'].values
                 labels = np.zeros(len(data))
                 horizon = CONFIG['HORIZON']
@@ -362,7 +372,7 @@ class DeepModelManager:
                         labels[i] = 1 # 涨
                     elif np.any(future_window <= curr * (1 - threshold)):
                         labels[i] = 2 # 跌
-                y = labels[self.lookback:] # 对齐 X
+                y = labels[self.lookback:]
             else:
                 # 波动率
                 vol = df['log_ret'].rolling(20).std().shift(-20).values * 10000
@@ -370,64 +380,75 @@ class DeepModelManager:
         
         return X, y
 
-    def train(self, df_list):
-        print(f"\n🔄 [Training] 开始训练模型: {self.name}")
+    def train(self, df_list, pretrained_path=None, production_mode=True):
+        mode_str = "实盘全量 (Production)" if production_mode else "回测 (Backtest)"
+        print(f"\n🔄 [Training] 开始训练模型: {self.name} | 模式: {mode_str}")
         
-        # 1. 全局 Scaler Fit (抽取所有数据计算均值方差)
+        # 1. Scaler Fit (始终使用当前数据 Fit，保持对当前波动率的敏感)
         print("   -> 计算全局统计量 (Scaler Fit)...")
-        all_raw_data = []
-        # 采样部分数据以节省内存，或者全部
-        for df in df_list:
-            all_raw_data.append(df[self.input_cols].values)
-        
+        all_raw_data = [df[self.input_cols].values for df in df_list]
         full_matrix = np.concatenate(all_raw_data, axis=0)
         full_matrix = np.nan_to_num(full_matrix, nan=0.0, posinf=0.0, neginf=0.0)
         
         self.trained_scaler = StandardScaler()
         self.trained_scaler.fit(full_matrix)
-        del full_matrix, all_raw_data # 释放内存
+        del full_matrix, all_raw_data 
 
-        # 2. 逐日生成训练集 (X, y)
-        print("   -> 逐日生成张量 (避免跨日污染)...")
+        # 2. 准备训练集
+        if production_mode:
+            train_df_list = df_list # 实盘用所有数据
+        else:
+            train_days = int(len(df_list) * 0.8) # 回测留一部分验证
+            train_df_list = df_list[:train_days]
+            
         X_all, y_all = [], []
-        
-        # 留最后几天做验证 (80/20 Split by Days)
-        train_days = int(len(df_list) * 0.8)
-        train_df_list = df_list[:train_days]
-        
         for df in train_df_list:
             X_day, y_day = self._prepare_single_day(df, fit=True, scaler=self.trained_scaler)
             if X_day is not None:
-                # 再次对齐长度
                 min_len = min(len(X_day), len(y_day))
                 X_all.append(X_day[:min_len])
                 y_all.append(y_day[:min_len])
         
         X_train = np.concatenate(X_all, axis=0)
         y_train = np.concatenate(y_all, axis=0)
-        
-        print(f"   -> 训练集形状: {X_train.shape}")
+        print(f"   -> 训练集样本数: {len(X_train)}")
         
         ds = TensorDataset(torch.FloatTensor(X_train), 
                            torch.LongTensor(y_train) if self.is_cls else torch.FloatTensor(y_train))
         dl = DataLoader(ds, batch_size=64, shuffle=True)
         
-        # 初始化模型
+        # 3. 初始化模型
         input_dim = len(self.input_cols)
         if self.is_cls:
             model = self.model_cls(input_dim, d_model=256, num_layers=6).to(CONFIG['DEVICE'])
             loss_fn = nn.CrossEntropyLoss(weight=torch.FloatTensor([0.2, 1.0, 1.0]).to(CONFIG['DEVICE']))
-            lr = 5e-5
+            base_lr = 5e-5
         else:
             model = self.model_cls(input_dim, d_model=128, num_layers=3).to(CONFIG['DEVICE'])
             loss_fn = nn.MSELoss()
-            lr = 1e-4
+            base_lr = 1e-4
+
+        # 4. 热启动 (Warm Start)
+        is_finetuning = False
+        if pretrained_path:
+            state_dict = self.load_checkpoint(pretrained_path, CONFIG['DEVICE'])
+            if state_dict:
+                try:
+                    model.load_state_dict(state_dict)
+                    print("✅ 成功加载预训练权重，进入微调模式...")
+                    is_finetuning = True
+                    base_lr = base_lr * 0.2 # 微调时降低学习率
+                except Exception as e:
+                    print(f"⚠️ 权重加载失败 (结构可能已变更): {e}")
+
+        # 设置 Epochs
+        epochs = CONFIG['FINETUNE_EPOCHS'] if is_finetuning else CONFIG['TRAIN_EPOCHS']
         
-        opt = optim.AdamW(model.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CONFIG['TRAIN_EPOCHS'], eta_min=1e-6)
+        opt = optim.AdamW(model.parameters(), lr=base_lr)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-7)
         
         model.train()
-        for epoch in range(CONFIG['TRAIN_EPOCHS']):
+        for epoch in range(epochs):
             total_loss = 0
             for bx, by in dl:
                 bx, by = bx.to(CONFIG['DEVICE']), by.to(CONFIG['DEVICE'])
@@ -439,19 +460,19 @@ class DeepModelManager:
                 total_loss += loss.item()
             
             scheduler.step()
-            if (epoch+1) % 5 == 0:
-                print(f"   Epoch {epoch+1:02d}/{CONFIG['TRAIN_EPOCHS']} | Loss: {total_loss/len(dl):.6f} | LR: {opt.param_groups[0]['lr']:.2e}")
+            if (epoch+1) % 5 == 0 or epoch == epochs-1:
+                print(f"   Epoch {epoch+1:02d}/{epochs} | Loss: {total_loss/len(dl):.6f} | LR: {opt.param_groups[0]['lr']:.2e}")
         
         self.trained_model = model
         return model
 
-    def process(self, df_list):
+    def process(self, df_list, pretrained_path=None, production_mode=True):
         # 训练
-        model = self.train(df_list)
+        model = self.train(df_list, pretrained_path=pretrained_path, production_mode=production_mode)
         model.eval()
         
-        # 推理 (对每一天分别推理，然后拼接结果)
-        print("   -> 开始推理...")
+        # 推理 (生成因子)
+        print("   -> 开始生成因子数据...")
         all_results_df = []
         
         for df in df_list:
@@ -471,10 +492,8 @@ class DeepModelManager:
                         outs.append(res[1].cpu().numpy())
             
             vals = np.concatenate(outs)
-            # 生成该日的 Result DataFrame (对齐索引)
-            # 注意: X_day 是从 lookback 开始的
             day_res = pd.DataFrame(index=df.index[self.lookback:])
-            # 裁剪以防万一
+            
             min_l = min(len(vals), len(day_res))
             day_res = day_res.iloc[:min_l]
             vals = vals[:min_l]
@@ -497,12 +516,20 @@ def main():
     main_files = DataLoaderService.get_daily_files(CONFIG['MAIN_SYMBOL'])
     aux_files = DataLoaderService.get_daily_files(CONFIG['AUX_SYMBOL'])
     
-    # 找交集日期 (确保同一天都有数据)
+    # 找交集日期
     common_dates = sorted(list(set(main_files.keys()) & set(aux_files.keys())))
-    print(f"✅ 找到 {len(common_dates)} 个共同交易日: {common_dates[:3]} ...")
     
-    if not common_dates:
-        print("❌ 没有找到共同日期的文件，请检查文件名格式 (symbol-YYYY-MM-DD.csv)")
+    # --- 滚动窗口逻辑 (Rolling Window) ---
+    if len(common_dates) > CONFIG['ROLLING_WINDOW_SIZE']:
+        print(f"✂️ 数据超过 {CONFIG['ROLLING_WINDOW_SIZE']} 天，进行滚动截断...")
+        training_dates = common_dates[-CONFIG['ROLLING_WINDOW_SIZE']:]
+    else:
+        training_dates = common_dates
+        
+    print(f"✅ 最终纳入计算日期: {training_dates[0]} ~ {training_dates[-1]} (共 {len(training_dates)} 天)")
+    
+    if not training_dates:
+        print("❌ 没有找到有效数据文件")
         return
 
     # 2. 逐日加载、合并、注入因子 (预处理)
@@ -510,8 +537,7 @@ def main():
     manual_gen = ManualFactorGenerator()
     
     print("\n⚡ [Preprocessing] 逐日清洗与因子注入...")
-    for date in common_dates:
-        # 加载
+    for date in training_dates:
         f_main = main_files[date]
         f_aux = aux_files[date]
         
@@ -520,11 +546,9 @@ def main():
         
         if df_m is None or df_a is None: continue
         
-        # 合并
         df_day = df_m.join(df_a, how='inner')
-        if len(df_day) < 200: continue # 跳过数据太少的日子
+        if len(df_day) < 200: continue 
         
-        # 注入手工因子 (Day-by-Day, safe from cross-day leakage)
         df_manual = manual_gen.process(df_day)
         df_final = df_day.join(df_manual, how='inner')
         
@@ -533,38 +557,35 @@ def main():
     print(f"📊 预处理完成，有效天数: {len(daily_df_list)}")
     if not daily_df_list: return
 
-    # 3. 确定特征列表 (取第一天的数据来获取列名)
+    # 3. 确定特征列表
     sample_df = daily_df_list[0]
     excludes = ['tx_server_time', 'datetime']
     feats = [c for c in sample_df.columns if c not in excludes and np.issubdtype(sample_df[c].dtype, np.number)]
     print(f"🔹 模型特征维度: {len(feats)}")
 
-    # 4. 初始化模型管理器
+    # 4. 检查是否有旧模型 (用于热启动)
+    pretrained_path = CONFIG['ARTIFACT_NAME'] if os.path.exists(CONFIG['ARTIFACT_NAME']) else None
+    
+    # 5. 初始化模型管理器
     dir_mgr = DeepModelManager("direction", Direction, feats, lookback=CONFIG['MAX_LOOKBACK'], is_cls=True)
     miner_mgr = DeepModelManager("miner", HybridMinerNet, feats, lookback=60, n_factors=128, is_cls=False)
 
-    # 5. 训练与推理 (传入列表，内部处理)
-    # Direction
-    res_dir = dir_mgr.process(daily_df_list)
-    # Miner
-    res_miner = miner_mgr.process(daily_df_list)
+    # 6. 训练与推理 (Production Mode = True)
+    # 传入 pretrained_path 尝试进行微调
+    res_dir = dir_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=True)#注意回测改这里
+    res_miner = miner_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=True)#还有这里
     
-    # 手工因子结果 (拼接所有天)
-    # 注意: 需要先把 daily_df_list 里的手工因子提取出来拼在一起，方便最后导出
-    # 我们只需保留手工因子列
+    # 7. 手工因子合并
     manual_cols = [c for c in sample_df.columns if c.startswith('alpha_') or c.startswith('logic_')]
-    res_manual_list = [day[manual_cols].iloc[CONFIG['MAX_LOOKBACK']:] for day in daily_df_list] # 简单截断对齐
+    res_manual_list = [day[manual_cols].iloc[CONFIG['MAX_LOOKBACK']:] for day in daily_df_list]
     res_manual = pd.concat(res_manual_list, axis=0)
 
-    # 6. 最终合并与筛选
-    # 对齐索引 (Inner Join)
+    # 8. 最终合并与筛选
     final_df = pd.concat([res_dir, res_miner, res_manual], axis=1).dropna()
     
-    # 构造 Target (用于 IC 计算)
-    # 需要对每一天分别算 ret shift，再拼起来
+    # 构造 Target 计算 IC
     target_list = []
     for day in daily_df_list:
-        # Shift -20
         t = day['log_ret'].shift(-20).iloc[CONFIG['MAX_LOOKBACK']:]
         target_list.append(t)
     target = pd.concat(target_list, axis=0).reindex(final_df.index).fillna(0)
@@ -579,15 +600,14 @@ def main():
     selected_factors = sorted(ic_map.keys(), key=lambda x: ic_map[x], reverse=True)[:135]
     final_output = final_df[selected_factors]
 
-    # 7. 打包
+    # 9. 保存成果
     strategy_artifact = {
         'meta': {
-            'description': 'Multi-Day Hybrid Strategy',
-            'train_dates': common_dates,
+            'description': 'Multi-Day Hybrid Strategy (Rolling Updated)',
+            'train_dates': training_dates,
+            'rolling_window': CONFIG['ROLLING_WINDOW_SIZE'],
             'input_feature_count': len(feats),
-            'output_factor_count': len(selected_factors),
-            'lookback_direction': CONFIG['MAX_LOOKBACK'],
-            'threshold': CONFIG['BARRIER_THRESHOLD']
+            'output_factor_count': len(selected_factors)
         },
         'features': {'input_names': feats, 'output_names': selected_factors},
         'models': {
@@ -601,7 +621,7 @@ def main():
     torch.save(strategy_artifact, CONFIG['ARTIFACT_NAME'])
     final_output.to_csv(CONFIG['FACTOR_LIB_NAME'])
     
-    print(f"\n✅ 全部完成! 包含 {len(common_dates)} 天的训练成果已保存。")
+    print(f"\n✅ 全部完成! 已更新模型并保存因子库。")
 
 if __name__ == "__main__":
     main()
