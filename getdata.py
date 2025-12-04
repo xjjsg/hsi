@@ -600,7 +600,7 @@ async def main():
     # 2. 启动浏览器和百度 Index Worker
     async with async_playwright() as p:
         # 提示：如果想看到浏览器弹窗，把 headless=True 改为 False
-        browser = await p.chromium.launch(headless=True) 
+        browser = await p.chromium.launch(headless=False) 
         baidu_tasks = []
         for cfg in BAIDU_CONFIGS:
             baidu_tasks.append(asyncio.create_task(run_baidu_page(cfg, browser)))
