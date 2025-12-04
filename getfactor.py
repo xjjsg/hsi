@@ -572,8 +572,8 @@ def main():
 
     # 6. 训练与推理 (Production Mode = True)
     # 传入 pretrained_path 尝试进行微调
-    res_dir = dir_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=True)#注意回测改这里
-    res_miner = miner_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=True)#还有这里
+    res_dir = dir_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=False)#注意回测改这里
+    res_miner = miner_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=False)#还有这里
     
     # 7. 手工因子合并
     manual_cols = [c for c in sample_df.columns if c.startswith('alpha_') or c.startswith('logic_')]
