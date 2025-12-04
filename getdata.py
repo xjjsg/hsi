@@ -7,7 +7,7 @@ import time
 import sys
 import json
 import numpy as np
-from datetime import datetime, time as dt_time  # 引入 time 类用于比较
+from datetime import datetime, time as dt_time
 from playwright.async_api import async_playwright, Browser
 
 # ================= 配置区域 =================
@@ -545,30 +545,77 @@ class SinaDataWorker:
 #                                MAIN ENTRY POINT
 # ==============================================================================
 
+async def wait_for_data_ready(timeout=60):
+    """
+    等待全局缓存（Index, Futures, FX）初始化完成。
+    """
+    print(f"等待数据源初始化 (超时设置: {timeout}秒)...")
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        # 1. 检查指数数据 (Baidu)
+        index_ready = True
+        for cfg in BAIDU_CONFIGS:
+            key = cfg["key"]
+            if GLOBAL_INDEX_CACHE.get(key, {}).get("price", 0) <= 0:
+                index_ready = False
+                break
+        
+        # 2. 检查期货数据 (Sina)
+        futures_ready = False
+        for key, val in GLOBAL_FUTURES_CACHE.items():
+            if val.get("price", 0) > 0:
+                futures_ready = True
+                break
+        if not GLOBAL_FUTURES_CACHE: futures_ready = False
+
+        # 3. 检查汇率
+        fx_ready = GLOBAL_FX_CACHE.get("price", 0) > 0
+
+        # 如果全部就绪，返回 True
+        if index_ready and futures_ready and fx_ready:
+            print(f"数据源已就绪! (耗时 {time.time() - start_time:.2f}秒)")
+            return True
+        
+        # 打印当前状态
+        print(f"数据预热中... [Index:{index_ready}] [Fut:{futures_ready}] [FX:{fx_ready}]")
+        await asyncio.sleep(1)
+
+    print("警告: 数据预热超时，系统将强行启动 (可能会有部分数据缺失)。")
+    return False
+
 async def main():
     if sys.platform.startswith('win'):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    print("启动各模块...")
+    print("启动后台数据采集模块 (Sina/Sentiment/Baidu)...")
     
-    sentiment_worker = SentimentWorker()
-    task_sentiment = asyncio.create_task(sentiment_worker.run())
-
-    tencent_worker = TencentETFWorker()
-    task_tencent = asyncio.create_task(tencent_worker.run())
-    
+    # 1. 启动辅助 Worker (Sina, Sentiment)
     sina_worker = SinaDataWorker()
     task_sina = asyncio.create_task(sina_worker.run())
 
+    sentiment_worker = SentimentWorker()
+    task_sentiment = asyncio.create_task(sentiment_worker.run())
+
+    # 2. 启动浏览器和百度 Index Worker
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # 提示：如果想看到浏览器弹窗，把 headless=True 改为 False
+        browser = await p.chromium.launch(headless=True) 
         baidu_tasks = []
         for cfg in BAIDU_CONFIGS:
             baidu_tasks.append(asyncio.create_task(run_baidu_page(cfg, browser)))
         
+        # 3. 【关键修改】阻塞等待，直到缓存中有数据
+        await wait_for_data_ready(timeout=60)
+
+        print("启动主记录模块 (TencentETFWorker)...")
+        tencent_worker = TencentETFWorker()
+        task_tencent = asyncio.create_task(tencent_worker.run())
+        
+        # 4. 汇总所有任务
         all_tasks = [task_tencent, task_sina, task_sentiment] + baidu_tasks
         try:
-            print("系统运行中... (按 Ctrl+C 停止)")
+            print("系统全速运行中... (按 Ctrl+C 停止)")
             await asyncio.gather(*all_tasks)
         except Exception as e:
             print(f"Main Loop Error: {e}")
