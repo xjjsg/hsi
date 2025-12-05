@@ -29,7 +29,7 @@ CONFIG = {
     'HORIZON': 20,           
     'RESAMPLE_FREQ': '3s',   
     'TRAIN_EPOCHS': 30,      # 初始训练轮数
-    'FINETUNE_EPOCHS': 10,   # 微调训练轮数
+    'FINETUNE_EPOCHS': 15,   # 微调训练轮数
     'BARRIER_THRESHOLD': 0.002, 
     
     # --- 滚动窗口 ---
@@ -327,7 +327,9 @@ class DeepModelManager:
         """加载预训练权重（热启动的关键）"""
         if os.path.exists(path):
             try:
-                checkpoint = torch.load(path, map_location=device)
+                # 【修改点】强制允许加载所有 Python 对象 (如 sklearn scaler)
+                checkpoint = torch.load(path, map_location=device, weights_only=False)
+                
                 model_key = f"{self.name}_state_dict"
                 if model_key in checkpoint['models']:
                     print(f"   -> 发现预训练权重: {model_key}")
@@ -572,8 +574,8 @@ def main():
 
     # 6. 训练与推理 (Production Mode = True)
     # 传入 pretrained_path 尝试进行微调
-    res_dir = dir_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=False)#注意回测改这里
-    res_miner = miner_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=False)#还有这里
+    res_dir = dir_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=True)#注意回测改这里
+    res_miner = miner_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=True)#还有这里
     
     # 7. 手工因子合并
     manual_cols = [c for c in sample_df.columns if c.startswith('alpha_') or c.startswith('logic_')]
