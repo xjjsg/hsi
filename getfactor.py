@@ -4,67 +4,297 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
-from scipy.stats import spearmanr
 import os
-import math
 import glob
 import re
 import warnings
+import math
+from datetime import datetime, time as dt_time
 
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. 项目环境配置 (Project Configuration)
+# 0. 全局配置
 # ==============================================================================
 CONFIG = {
     # --- 路径配置 ---
-    'DATA_DIR': './data',   # 数据根目录 HSI/data/
-    'MAIN_SYMBOL': 'sz159920', # 主力标的代码 (文件夹名)
-    'AUX_SYMBOL':  'sh513130', # 辅助标的代码 (文件夹名)
-    
-    # --- 训练参数 ---
-    'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    'MAX_LOOKBACK': 120,     
-    'HORIZON': 20,           
+    'DATA_DIR': './data',   
+    'MAIN_SYMBOL': 'sz159920', # 主力标的
+    'AUX_SYMBOL':  'sh513130', # 辅助标的 (HSTECH)
+    # --- 计算设备 ---
+
+    'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"), 
+    # --- 训练核心参数 ---
+    'MAX_LOOKBACK': 60,      # 输入窗口：3分钟 (60 tick)
+    'HORIZON': 60,           # 预测窗口：3分钟 (60 tick) [基于波动率分析结论]
     'RESAMPLE_FREQ': '3s',   
-    'TRAIN_EPOCHS': 30,      # 初始训练轮数
-    'FINETUNE_EPOCHS': 15,   # 微调训练轮数
-    'BARRIER_THRESHOLD': 0.002, 
+    'TRAIN_EPOCHS': 30,      
+    'BATCH_SIZE': 512,       
+    'LEARNING_RATE': 1e-4,
     
-    # --- 滚动窗口 ---
-    'ROLLING_WINDOW_SIZE': 60, # 只使用最近N天的数据
+    # --- 交易成本参数 ---
+    'COST_THRESHOLD': 0.001, # 刚性成本 0.1% (用于标签过滤)
+    'SIM_COST_TAKER': 0.0006, # Taker 费率 (手续费+冲击)
+    'SIM_COST_MAKER': 0.0001, # Maker 费率 (仅手续费)
     
     # --- 输出 ---
     'ARTIFACT_NAME': 'FACTOR_STRATEGY_ARTIFACT.pth',
     'FACTOR_LIB_NAME': 'factor_lib_final.csv'
 }
 
-print(f"🚀 Factor Factory Multi-Day Engine | Device: {CONFIG['DEVICE']}")
+print(f"🚀 Factor Factory Final | Horizon: 3min | Valid: SimTrader PnL")
 
 # ==============================================================================
-# 1. 多日数据加载服务 (Multi-Day Data Loader)
+# 1. 核心组件：损失函数与模型
 # ==============================================================================
+
+class WeightedMSELoss(nn.Module):
+    """
+    波动率加权损失：重罚错过大波动的行为
+    """
+    def __init__(self, penalty_factor=5.0):
+        super().__init__()
+        self.penalty = penalty_factor
+        self.mse = nn.MSELoss(reduction='none')
+
+    def forward(self, pred, target):
+        loss = self.mse(pred.view(-1), target.view(-1))
+        abs_target = torch.abs(target.view(-1))
+        # 权重 = 1.0 + Penalty * (波动幅度 / 成本阈值)
+        weights = 1.0 + self.penalty * (abs_target / CONFIG['COST_THRESHOLD'])
+        weighted_loss = (loss * weights).mean()
+        return weighted_loss
+
+class Time2Vec(nn.Module):
+    def __init__(self, output_dim=8):
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(1, output_dim))
+        self.b = nn.Parameter(torch.randn(1, output_dim))
+    
+    def forward(self, x):
+        return torch.sin(x @ self.w + self.b)
+
+class QuantModel(nn.Module):
+    """
+    轻量化模型：Stem + TimeEmb + 2-Layer Transformer
+    """
+    def __init__(self, input_dim, d_model=128, nhead=8, num_layers=3):
+        super().__init__()
+        
+        self.stem = nn.Sequential(
+            nn.Conv1d(input_dim, d_model, 1),
+            nn.BatchNorm1d(d_model),
+            nn.LeakyReLU()
+        )
+        self.time_emb = Time2Vec(output_dim=d_model)
+        
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, 
+            dim_feedforward=128, dropout=0.3, 
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.se_fc = nn.Sequential(
+            nn.Linear(d_model, d_model // 4, bias=False),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, d_model, bias=False),
+            nn.Sigmoid()
+        )
+        
+        self.head = nn.Sequential(
+            nn.Linear(d_model, 32),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, 1) 
+        )
+
+    def forward(self, x):
+        x_time = x[:, :, -1:] 
+        x_feat = x[:, :, :-1]
+        
+        t_emb = self.time_emb(x_time)
+        
+        h = x_feat.permute(0, 2, 1) 
+        h = self.stem(h)
+        
+        b, c, t = h.size()
+        y = self.avg_pool(h).view(b, c)
+        y = self.se_fc(y).view(b, c, 1)
+        h = h * y.expand_as(h)
+        
+        h = h.permute(0, 2, 1)
+        h = h + t_emb
+        
+        h = self.transformer(h)
+        return self.head(h[:, -1, :])
+
+# ==============================================================================
+# 2. 模拟交易引擎 (Validation Engine)
+# ==============================================================================
+class SimTrader:
+    """
+    集成了动态挂单管理和午盘套利逻辑的验证引擎
+    """
+    @staticmethod
+    def run_simulation(model, df, feature_cols):
+        model.eval()
+        
+        # 1. 准备数据
+        raw_vals = df[feature_cols].values
+        raw_vals = np.clip(raw_vals, -10, 10)
+        raw_vals = np.nan_to_num(raw_vals)
+        
+        prices = df['mid_price'].values
+        # 尝试获取买一卖一，如果没有则用 Mid 模拟
+        if 'sp1' in df.columns:
+            ask_prices = df['sp1'].values
+            bid_prices = df['bp1'].values
+        else:
+            ask_prices = prices * 1.0005
+            bid_prices = prices * 0.9995
+            
+        index_prices = df['index_price'].values if 'index_price' in df.columns else np.zeros_like(prices)
+        times = df.index.time
+        
+        # 2. 批量推理
+        lookback = CONFIG['MAX_LOOKBACK']
+        X_batch = []
+        for i in range(lookback, len(raw_vals)):
+            X_batch.append(raw_vals[i-lookback : i])
+            
+        if not X_batch: return 0.0
+        
+        preds = []
+        batch_size = 1024
+        with torch.no_grad():
+            for i in range(0, len(X_batch), batch_size):
+                bx = np.array(X_batch[i:i+batch_size])
+                tensor = torch.FloatTensor(bx).to(CONFIG['DEVICE'])
+                out = model(tensor)
+                preds.extend(out.cpu().view(-1).numpy())
+
+        # 3. 逐 Tick 事件循环
+        cash = 100000.0
+        position = 0
+        pending_order = None # {'direction': 1/-1, 'price': float, 'start_tick': int}
+        
+        noon_close_idx = -1
+        noon_open_checked = False
+        
+        taker_fee = CONFIG['SIM_COST_TAKER']
+        maker_fee = CONFIG['SIM_COST_MAKER']
+        
+        for i, pred_ret in enumerate(preds):
+            idx = lookback + i
+            curr_time = times[idx]
+            curr_mid = prices[idx]
+            curr_ask = ask_prices[idx]
+            curr_bid = bid_prices[idx]
+            curr_idx_price = index_prices[idx]
+            
+            # --- 日内风控: 14:55 清仓 ---
+            if curr_time >= dt_time(14, 55):
+                if position > 0:
+                    cash += position * curr_bid * (1 - taker_fee)
+                    position = 0
+                pending_order = None
+                continue
+            
+            # --- 策略: 午盘套利 ---
+            if curr_time <= dt_time(11, 30, 5) and curr_time >= dt_time(11, 29, 0):
+                noon_close_idx = idx
+            
+            if not noon_open_checked and curr_time >= dt_time(13, 0, 0):
+                noon_open_checked = True
+                if noon_close_idx != -1:
+                    p_close_etf = prices[noon_close_idx]
+                    p_close_idx = index_prices[noon_close_idx]
+                    p_open_etf = curr_mid 
+                    p_open_idx = curr_idx_price 
+                    if p_close_idx > 0 and p_close_etf > 0:
+                        idx_ret = p_open_idx / p_close_idx - 1
+                        etf_ret = p_open_etf / p_close_etf - 1
+                        gap = idx_ret - etf_ret
+                        # 强力买入/卖出信号
+                        if gap > 0.002: pred_ret = max(pred_ret, 0.01)
+                        elif gap < -0.002: pred_ret = min(pred_ret, -0.01)
+
+            # --- 策略: 挂单成交判定 ---
+            if pending_order:
+                if pending_order['direction'] == 1: # 买单
+                    if curr_ask <= pending_order['price']:
+                        vol = int(50000 / pending_order['price'] / 100) * 100
+                        if cash >= vol * pending_order['price'] * (1 + maker_fee):
+                            cash -= vol * pending_order['price'] * (1 + maker_fee)
+                            position = vol
+                            pending_order = None 
+                elif pending_order['direction'] == -1: # 卖单
+                    if curr_bid >= pending_order['price']:
+                        cash += position * pending_order['price'] * (1 - maker_fee)
+                        position = 0
+                        pending_order = None 
+            
+            # --- 策略: 订单生成与动态调整 ---
+            if position > 0:
+                # 动态调整卖出价
+                target_sell_price = curr_mid * (1 + max(0, pred_ret))
+                if pred_ret < -0.0005: # 预测反转，市价止损
+                    cash += position * curr_bid * (1 - taker_fee)
+                    position = 0
+                    pending_order = None
+                else:
+                    # 改单逻辑
+                    if pending_order is None or abs(target_sell_price - pending_order['price']) / curr_mid > 0.0002:
+                        pending_order = {'direction': -1, 'price': target_sell_price, 'start_tick': idx}
+            
+            elif position == 0:
+                # 开仓逻辑
+                if pred_ret > CONFIG['COST_THRESHOLD'] * 1.2:
+                    target_buy_price = curr_mid 
+                    if pending_order is None or abs(target_buy_price - pending_order['price']) / curr_mid > 0.0002:
+                        pending_order = {'direction': 1, 'price': target_buy_price, 'start_tick': idx}
+                else:
+                    if pending_order and pending_order['direction'] == 1:
+                        pending_order = None
+
+            # 超时撤单
+            if pending_order and (idx - pending_order['start_tick']) > 60:
+                pending_order = None
+                
+        # 最终结算
+        if position > 0:
+            cash += position * prices[-1] * (1 - taker_fee)
+            
+        return cash - 100000.0
+
+# ==============================================================================
+# 3. 数据工厂与文件提取 (恢复原始稳健逻辑)
+# ==============================================================================
+
 class DataLoaderService:
     @staticmethod
     def get_daily_files(symbol):
         """
         扫描 HSI/data/{symbol}/ 下的所有 csv 文件
         返回字典: { '2025-11-26': '完整路径', ... }
+        参考原始代码逻辑
         """
         dir_path = os.path.join(CONFIG['DATA_DIR'], symbol)
         if not os.path.exists(dir_path):
             print(f"❌ 目录未找到: {dir_path}")
             return {}
         
-        # 匹配 symbol-日期.csv 的模式
         pattern = os.path.join(dir_path, f"{symbol}-*.csv")
         files = glob.glob(pattern)
         
         date_map = {}
+        # 兼容性修复：使用 Regex 提取完整日期 YYYY-MM-DD
+        date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
+        
         for f in files:
-            # 提取日期 (假设格式为 *-YYYY-MM-DD.csv)
-            match = re.search(r'(\d{4}-\d{2}-\d{2})', os.path.basename(f))
+            match = date_pattern.search(os.path.basename(f))
             if match:
                 date_str = match.group(1)
                 date_map[date_str] = f
@@ -73,557 +303,244 @@ class DataLoaderService:
 
     @staticmethod
     def load_single_day(filepath, is_aux=False):
-        """加载单日单文件并进行基础清洗"""
+        """
+        加载单日数据并进行聚合
+        """
         try:
             raw = pd.read_csv(filepath)
             
-            # 1. 时间处理
+            # 时间处理
             if 'tx_local_time' in raw.columns:
                 raw['datetime'] = pd.to_datetime(raw['tx_local_time'], unit='ms')
-                if raw['datetime'].dt.tz is None:
-                    raw['datetime'] = raw['datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
+                raw['datetime'] = raw['datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
                 df = raw.set_index('datetime').sort_index()
             else:
-                df = raw
+                return None
 
-            # 2. 动态聚合 (L1-L5)
+            # 聚合规则
             agg_rules = {
-                'price': 'last', 'tick_vol': 'sum', 'tick_amt': 'sum', 'tick_vwap': 'mean',
-                'premium_rate': 'last', 'sentiment': 'last',
+                'price': 'last', 'tick_vol': 'sum', 'tick_amt': 'sum',
                 'bp1':'last', 'bv1':'last', 'sp1':'last', 'sv1':'last'
             }
             if 'index_price' in df.columns: agg_rules['index_price'] = 'last'
-            if not is_aux and 'fut_price' in df.columns: agg_rules['fut_price'] = 'last'
-            
-            for i in range(2, 6):
-                if f'bp{i}' in df.columns:
-                    agg_rules[f'bp{i}'] = 'last'; agg_rules[f'bv{i}'] = 'last'
-                    agg_rules[f'sp{i}'] = 'last'; agg_rules[f'sv{i}'] = 'last'
+            for c in ['bp2','bv2','sp2','sv2','bp5','bv5','sp5','sv5']:
+                if c in df.columns: agg_rules[c] = 'last'
 
-            # 3. 重采样
             df = df.resample(CONFIG['RESAMPLE_FREQ']).agg(agg_rules).ffill().dropna()
 
-            # 4. 基础特征 (日内独立计算)
+            # 基础特征
             df['mid_price'] = (df['bp1'] + df['sp1']) / 2
             df['log_ret'] = np.log(df['mid_price'] / df['mid_price'].shift(1)).fillna(0)
             
-            depth_l1 = df['bv1'] + df['sv1'] + 1e-6
-            df['feat_imb'] = (df['bv1'] - df['sv1']) / depth_l1
-            df['feat_spread'] = (df['sp1'] - df['bp1']) / df['mid_price']
-            
-            if 'bv5' in df.columns:
-                bv_all = sum(df[f'bv{i}'] for i in range(1, 6))
-                sv_all = sum(df[f'sv{i}'] for i in range(1, 6))
-                df['feat_depth_total'] = bv_all + sv_all
-                df['feat_imb_5'] = (bv_all - sv_all) / (df['feat_depth_total'] + 1e-6)
-            
-            if 'bp5' in df.columns:
-                df['feat_bid_slope'] = (df['bp1'] - df['bp5']) / 5
-                df['feat_ask_slope'] = (df['sp5'] - df['sp1']) / 5
-            else:
-                df['feat_bid_slope'] = 0; df['feat_ask_slope'] = 0
-            
-            depth_amt = (df['bv1'] * df['bp1']) + (df['sv1'] * df['sp1'])
-            df['feat_trade_intensity'] = df['tick_amt'] / (depth_amt + 1e-6)
-
-            df['feat_vol_chg'] = np.log(df['tick_vol'] + 1).diff().fillna(0)
-            ma_20 = df['mid_price'].rolling(20).mean()
-            std_20 = df['mid_price'].rolling(20).std()
-            df['feat_z_score'] = (df['mid_price'] - ma_20) / (std_20 + 1e-6)
-
             if is_aux: df = df.add_prefix('ctx_')
-            
             return df
         except Exception as e:
             print(f"❌ 读取错误 {filepath}: {e}")
             return None
 
-# ==============================================================================
-# 2. 神经网络组件 (Model Components - 保持不变)
-# ==============================================================================
-class SEBlock(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(SEBlock, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Sequential(nn.Linear(channel, channel // reduction, bias=False), nn.ReLU(inplace=True), nn.Linear(channel // reduction, channel, bias=False), nn.Sigmoid())
-    def forward(self, x):
-        b, c, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1)
-        return x * y.expand_as(x)
-
-class InceptionBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(InceptionBlock, self).__init__()
-        self.b1 = nn.Conv1d(in_channels, out_channels//4, 1)
-        self.b2 = nn.Sequential(nn.Conv1d(in_channels, out_channels//4, 1), nn.Conv1d(out_channels//4, out_channels//4, 3, padding=1))
-        self.b3 = nn.Sequential(nn.Conv1d(in_channels, out_channels//4, 1), nn.Conv1d(out_channels//4, out_channels//4, 5, padding=2))
-        self.b4 = nn.Sequential(nn.MaxPool1d(3, 1, 1), nn.Conv1d(in_channels, out_channels//4, 1))
-    def forward(self, x): return torch.cat([self.b1(x), self.b2(x), self.b3(x), self.b4(x)], dim=1)
-
-class AlphaLayer(nn.Module):
-    def __init__(self, input_dim, window=20):
-        super(AlphaLayer, self).__init__()
-        self.window = window
-        self.pool = nn.AvgPool1d(kernel_size=window, stride=1, padding=0)
-    def forward(self, x):
-        x = x.permute(0, 2, 1)
-        pad = torch.zeros(x.shape[0], x.shape[1], self.window-1).to(x.device)
-        x_pad = torch.cat([pad, x], dim=2)
-        mean = self.pool(x_pad)
-        std = torch.sqrt(torch.clamp(self.pool(torch.cat([pad, x**2], dim=2)) - mean**2, min=1e-6))
-        return torch.cat([x, mean, std], dim=1).permute(0, 2, 1)
-
-class TemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, dilation, dropout=0.2):
-        super(TemporalBlock, self).__init__()
-        padding = (kernel_size - 1) * dilation
-        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size, padding=padding, dilation=dilation)
-        self.relu1 = nn.GELU()
-        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size, padding=padding, dilation=dilation)
-        self.relu2 = nn.GELU()
-        self.chomp = padding 
-        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
-    def forward(self, x):
-        out = self.conv1(x)[:, :, :-self.chomp] 
-        out = self.relu1(out)
-        out = self.conv2(out)[:, :, :-self.chomp]
-        out = self.relu2(out)
-        res = x if self.downsample is None else self.downsample(x)
-        return out + res
-
-class SinusoidalPosEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div)
-        pe[:, 1::2] = torch.cos(position * div)
-        self.register_buffer('pe', pe.unsqueeze(0).transpose(0, 1))
-    def forward(self, x):
-        return x + self.pe[:x.size(0), :]
-
-class Direction(nn.Module):
-    def __init__(self, input_dim, d_model=256, nhead=16, num_layers=6, num_classes=3):
-        super(Direction, self).__init__()
-        self.stem = nn.Sequential(nn.Conv1d(input_dim, 64, 1), nn.BatchNorm1d(64), nn.LeakyReLU())
-        self.inception = InceptionBlock(64, d_model)
-        self.se = SEBlock(d_model)
-        self.pos_encoder = SinusoidalPosEncoding(d_model)
-        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=512, dropout=0.1)
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.fc = nn.Sequential(nn.Linear(d_model, 128), nn.GELU(), nn.Dropout(0.3), nn.Linear(128, num_classes))
-    def forward(self, x):
-        x = x.permute(0, 2, 1)
-        x = self.se(self.inception(self.stem(x))) 
-        x = x.permute(2, 0, 1) 
-        x = self.pos_encoder(x)
-        x = self.transformer(x)
-        return self.fc(x.mean(dim=0))
-
-class HybridMinerNet(nn.Module):
-    def __init__(self, input_dim, d_model=128, num_layers=3, n_factors=128):
-        super(HybridMinerNet, self).__init__()
-        self.alpha_layer = AlphaLayer(input_dim)
-        self.tcn = TemporalBlock(input_dim*3, d_model, kernel_size=3, dilation=1)
-        self.pos_encoder = SinusoidalPosEncoding(d_model)
-        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, dim_feedforward=256, dropout=0.1)
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.factor_head = nn.Sequential(nn.Linear(d_model, 256), nn.GELU(), nn.Linear(256, n_factors), nn.Tanh())
-        self.predictor = nn.Linear(n_factors, 1)
-
-    def forward(self, x):
-        x = self.alpha_layer(x)
-        x = x.permute(0, 2, 1)
-        x = self.tcn(x)
-        x = x.permute(2, 0, 1)
-        x = self.pos_encoder(x)
-        factors = self.factor_head(self.transformer(x)[-1]) 
-        return self.predictor(factors), factors
-
-# ==============================================================================
-# 3. 手工因子生成器 (Manual Factor Injection)
-# ==============================================================================
 class ManualFactorGenerator:
+    """
+    特征工程：使用 Rolling Z-Score 进行动态归一化
+    """
     def process(self, df):
-        # 针对单日 DataFrame 进行处理，无需担心跨日问题
         res = pd.DataFrame(index=df.index)
         
-        # 1. 资金流
+        # 1. 价格相对特征 (动态 Z-Score)
+        ma_20 = df['mid_price'].rolling(20).mean()
+        std_20 = df['mid_price'].rolling(20).std()
+        res['feat_dist_ma20'] = (df['mid_price'] - ma_20) / (std_20 + 1e-6)
+        res['feat_vol_20'] = std_20 / ma_20
+        
+        # 2. 资金流 VOI (比率归一化)
         db = df['bp1'].diff(); ds = df['sp1'].diff()
         dvb = df['bv1'].diff(); dvs = df['sv1'].diff()
         delta_vb = np.select([db > 0, db < 0], [df['bv1'], 0], default=dvb)
         delta_va = np.select([ds > 0, ds < 0], [0, df['sv1']], default=dvs)
         voi = delta_vb - delta_va
-        res['alpha_voi_raw'] = voi
         
-        vol_ma = df['tick_vol'].rolling(10).mean().replace(0, 1)
-        res['alpha_voi_smart'] = voi / vol_ma
-
-        if 'tick_vwap' in df.columns:
-            res['alpha_vwap_bias'] = (df['tick_vwap'] - df['mid_price']) / df['mid_price']
-
-        # 2. 深度微观 (L5)
-        if 'bv5' in df.columns:
-            sum_bid = sum(df[f'bv{i}'] for i in range(1, 6))
-            sum_ask = sum(df[f'sv{i}'] for i in range(1, 6))
-            total_depth = sum_bid + sum_ask + 1e-6
-            res['alpha_depth_imb_l5'] = (sum_bid - sum_ask) / total_depth
-            res['alpha_wall_bid'] = df['bv5'] / (df['bv1'] + 1)
-            res['alpha_wall_ask'] = df['sv5'] / (df['sv1'] + 1)
-
-        l1_imb = df['bv1'] / (df['bv1'] + df['sv1'] + 1e-6)
-        micro_price = df['bp1'] * (1 - l1_imb) + df['sp1'] * l1_imb
-        res['alpha_micro_dev'] = (micro_price - df['mid_price']) / df['mid_price']
-
-        # 3. 跨品种
+        vol_ma = df['tick_vol'].rolling(60).mean().replace(0, 1)
+        res['feat_voi_norm'] = voi / (vol_ma + 1e-6)
+        
+        # 3. 深度不平衡
+        depth = df['bv1'] + df['sv1'] + 1e-6
+        res['feat_imb'] = (df['bv1'] - df['sv1']) / depth
+        res['feat_spread'] = (df['sp1'] - df['bp1']) / df['mid_price']
+        
+        # 4. 辅助数据增强 (HSTECH)
         if 'ctx_mid_price' in df.columns:
-            res['alpha_cross_rs'] = df['log_ret'] - df['ctx_log_ret']
-            ctx_lag_2 = df['ctx_log_ret'].shift(2).fillna(0)
-            res['alpha_cross_lead_lag'] = ctx_lag_2 - df['log_ret']
+            res['feat_cross_rs'] = df['log_ret'] - df['ctx_log_ret']
+            
+            ctx_depth = df['ctx_bv1'] + df['ctx_sv1'] + 1e-6
+            ctx_imb = (df['ctx_bv1'] - df['ctx_sv1']) / ctx_depth
+            res['feat_imb_div'] = ctx_imb - res['feat_imb']
             
             spread = np.log(df['mid_price']) - np.log(df['ctx_mid_price'])
-            spread_mean = spread.rolling(120).mean()
-            spread_std = spread.rolling(120).std()
-            res['alpha_cross_arb_z'] = (spread - spread_mean) / (spread_std + 1e-6)
-            
-            if 'sentiment' in df.columns and 'ctx_sentiment' in df.columns:
-                res['alpha_sent_gap'] = df['sentiment'] - df['ctx_sentiment']
+            sp_mean = spread.rolling(120).mean()
+            sp_std = spread.rolling(120).std()
+            res['feat_cross_z'] = (spread - sp_mean) / (sp_std + 1e-6)
 
-        # 4. 场景
+        # 5. 时间特征
         minutes = df.index.hour * 60 + df.index.minute
         res['feat_time_norm'] = (minutes - 570) / (900 - 570)
         
-        mask_late = minutes >= 890 
-        res['logic_market_closing'] = 0.0
-        res.loc[mask_late, 'logic_market_closing'] = 1.0
-        
-        mask_open = (minutes >= 570) & (minutes <= 575)
-        res['logic_market_opening'] = 0.0
-        res.loc[mask_open, 'logic_market_opening'] = 1.0
-
-        if 'fut_price' in df.columns:
-            fut_ret = df['fut_price'].pct_change().fillna(0)
-            res['alpha_fut_lead'] = fut_ret - df['log_ret']
-
         return res.fillna(0)
 
 # ==============================================================================
-# 4. 深度模型管理器 (支持多日、滚动微调)
+# 4. 训练管理
 # ==============================================================================
 class DeepModelManager:
-    def __init__(self, name, model_cls, input_cols, lookback, n_factors=128, is_cls=False):
-        self.name = name
-        self.model_cls = model_cls
-        self.input_cols = input_cols
-        self.lookback = lookback
-        self.n_factors = n_factors
-        self.is_cls = is_cls
-        self.trained_model = None
-        self.trained_scaler = None
+    def __init__(self, feat_cols):
+        self.feat_cols = feat_cols
+        self.model = None
 
-    def load_checkpoint(self, path, device):
-        """加载预训练权重（热启动的关键）"""
-        if os.path.exists(path):
-            try:
-                # 【修改点】强制允许加载所有 Python 对象 (如 sklearn scaler)
-                checkpoint = torch.load(path, map_location=device, weights_only=False)
-                
-                model_key = f"{self.name}_state_dict"
-                if model_key in checkpoint['models']:
-                    print(f"   -> 发现预训练权重: {model_key}")
-                    return checkpoint['models'][model_key]
-            except Exception as e:
-                print(f"   -> 读取检查点失败: {e}")
-        return None
-
-    def _prepare_single_day(self, df, fit=False, scaler=None):
-        """对单日数据进行标准化和滑窗切片，避免跨日污染"""
-        raw = df[self.input_cols].values
-        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        if scaler:
-            data = scaler.transform(raw)
-        else:
-            data = raw
-            
-        # 滑窗切片
-        X_list = []
-        for i in range(self.lookback, len(data)):
-            X_list.append(data[i-self.lookback : i])
-        
-        if len(X_list) == 0: return None, None
-        X = np.array(X_list)
-        
-        # 生成标签 (仅 Training 阶段需要)
-        y = None
-        if fit:
-            if self.is_cls:
-                # 三势垒
-                prices = df['mid_price'].values
-                labels = np.zeros(len(data))
-                horizon = CONFIG['HORIZON']
-                threshold = CONFIG['BARRIER_THRESHOLD']
-                
-                valid_len = len(prices) - horizon
-                for i in range(valid_len):
-                    curr = prices[i]
-                    future_window = prices[i+1 : i+horizon+1]
-                    if np.any(future_window >= curr * (1 + threshold)):
-                        labels[i] = 1 # 涨
-                    elif np.any(future_window <= curr * (1 - threshold)):
-                        labels[i] = 2 # 跌
-                y = labels[self.lookback:]
-            else:
-                # 波动率
-                vol = df['log_ret'].rolling(20).std().shift(-20).values * 10000
-                y = np.nan_to_num(vol[self.lookback:], nan=0)
-        
-        return X, y
-
-    def train(self, df_list, pretrained_path=None, production_mode=True):
-        mode_str = "实盘全量 (Production)" if production_mode else "回测 (Backtest)"
-        print(f"\n🔄 [Training] 开始训练模型: {self.name} | 模式: {mode_str}")
-        
-        # 1. Scaler Fit (始终使用当前数据 Fit，保持对当前波动率的敏感)
-        print("   -> 计算全局统计量 (Scaler Fit)...")
-        all_raw_data = [df[self.input_cols].values for df in df_list]
-        full_matrix = np.concatenate(all_raw_data, axis=0)
-        full_matrix = np.nan_to_num(full_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        self.trained_scaler = StandardScaler()
-        self.trained_scaler.fit(full_matrix)
-        del full_matrix, all_raw_data 
-
-        # 2. 准备训练集
-        if production_mode:
-            train_df_list = df_list # 实盘用所有数据
-        else:
-            train_days = int(len(df_list) * 0.8) # 回测留一部分验证
-            train_df_list = df_list[:train_days]
-            
-        X_all, y_all = [], []
-        for df in train_df_list:
-            X_day, y_day = self._prepare_single_day(df, fit=True, scaler=self.trained_scaler)
-            if X_day is not None:
-                min_len = min(len(X_day), len(y_day))
-                X_all.append(X_day[:min_len])
-                y_all.append(y_day[:min_len])
-        
-        X_train = np.concatenate(X_all, axis=0)
-        y_train = np.concatenate(y_all, axis=0)
-        print(f"   -> 训练集样本数: {len(X_train)}")
-        
-        ds = TensorDataset(torch.FloatTensor(X_train), 
-                           torch.LongTensor(y_train) if self.is_cls else torch.FloatTensor(y_train))
-        dl = DataLoader(ds, batch_size=64, shuffle=True)
-        
-        # 3. 初始化模型
-        input_dim = len(self.input_cols)
-        if self.is_cls:
-            model = self.model_cls(input_dim, d_model=256, num_layers=6).to(CONFIG['DEVICE'])
-            loss_fn = nn.CrossEntropyLoss(weight=torch.FloatTensor([0.2, 1.0, 1.0]).to(CONFIG['DEVICE']))
-            base_lr = 5e-5
-        else:
-            model = self.model_cls(input_dim, d_model=128, num_layers=3).to(CONFIG['DEVICE'])
-            loss_fn = nn.MSELoss()
-            base_lr = 1e-4
-
-        # 4. 热启动 (Warm Start)
-        is_finetuning = False
-        if pretrained_path:
-            state_dict = self.load_checkpoint(pretrained_path, CONFIG['DEVICE'])
-            if state_dict:
-                try:
-                    model.load_state_dict(state_dict)
-                    print("✅ 成功加载预训练权重，进入微调模式...")
-                    is_finetuning = True
-                    base_lr = base_lr * 0.2 # 微调时降低学习率
-                except Exception as e:
-                    print(f"⚠️ 权重加载失败 (结构可能已变更): {e}")
-
-        # 设置 Epochs
-        epochs = CONFIG['FINETUNE_EPOCHS'] if is_finetuning else CONFIG['TRAIN_EPOCHS']
-        
-        opt = optim.AdamW(model.parameters(), lr=base_lr)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-7)
-        
-        model.train()
-        for epoch in range(epochs):
-            total_loss = 0
-            for bx, by in dl:
-                bx, by = bx.to(CONFIG['DEVICE']), by.to(CONFIG['DEVICE'])
-                opt.zero_grad()
-                out = model(bx)
-                loss = loss_fn(out if self.is_cls else out[0].squeeze(), by)
-                loss.backward()
-                opt.step()
-                total_loss += loss.item()
-            
-            scheduler.step()
-            if (epoch+1) % 5 == 0 or epoch == epochs-1:
-                print(f"   Epoch {epoch+1:02d}/{epochs} | Loss: {total_loss/len(dl):.6f} | LR: {opt.param_groups[0]['lr']:.2e}")
-        
-        self.trained_model = model
-        return model
-
-    def process(self, df_list, pretrained_path=None, production_mode=True):
-        # 训练
-        model = self.train(df_list, pretrained_path=pretrained_path, production_mode=production_mode)
-        model.eval()
-        
-        # 推理 (生成因子)
-        print("   -> 开始生成因子数据...")
-        all_results_df = []
+    def prepare_xy(self, df_list, is_train=True):
+        X, y = [], []
+        threshold = CONFIG['COST_THRESHOLD']
         
         for df in df_list:
-            X_day, _ = self._prepare_single_day(df, fit=False, scaler=self.trained_scaler)
-            if X_day is None: continue
+            raw = df[self.feat_cols].values
+            raw = np.clip(raw, -10, 10)
+            raw = np.nan_to_num(raw)
             
-            X_tensor = torch.FloatTensor(X_day).to(CONFIG['DEVICE'])
-            outs = []
-            with torch.no_grad():
-                for i in range(0, len(X_tensor), 256):
-                    batch = X_tensor[i:i+256]
-                    res = model(batch)
-                    if self.is_cls:
-                        prob = torch.softmax(res, dim=1)
-                        outs.append((prob[:,1]-prob[:,2]).cpu().numpy())
-                    else:
-                        outs.append(res[1].cpu().numpy())
+            # Target: 预测 Horizon 后的累计收益
+            target = df['log_ret'].rolling(CONFIG['HORIZON']).sum().shift(-CONFIG['HORIZON'])
+            target = target.fillna(0).values
             
-            vals = np.concatenate(outs)
-            day_res = pd.DataFrame(index=df.index[self.lookback:])
+            # 标签过滤 (Soft Threshold)：仅在训练时应用
+            if is_train:
+                mask = np.abs(target) < threshold
+                target[mask] = 0.0
             
-            min_l = min(len(vals), len(day_res))
-            day_res = day_res.iloc[:min_l]
-            vals = vals[:min_l]
+            lookback = CONFIG['MAX_LOOKBACK']
+            for i in range(lookback, len(raw) - CONFIG['HORIZON']):
+                X.append(raw[i-lookback : i])
+                y.append(target[i])
+                
+        return np.array(X), np.array(y)
+
+    def run(self, train_dfs, valid_dfs):
+        print(f"🔄 构建训练集 ({len(train_dfs)}天)...")
+        X_train, y_train = self.prepare_xy(train_dfs, is_train=True)
+        if len(X_train) == 0: return 0.0
+        
+        train_ds = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+        train_dl = DataLoader(train_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=True)
+        
+        self.model = QuantModel(input_dim=len(self.feat_cols)-1).to(CONFIG['DEVICE'])
+        criterion = WeightedMSELoss(penalty_factor=10.0) 
+        optimizer = optim.AdamW(self.model.parameters(), lr=CONFIG['LEARNING_RATE'])
+        
+        best_pnl = -99999.0
+        
+        print(f"\n🔥 开始训练 | 目标: SimTrader PnL (Dynamic Orders)")
+        print("-" * 65)
+        
+        for epoch in range(CONFIG['TRAIN_EPOCHS']):
+            self.model.train()
+            total_loss = 0
+            for bx, by in train_dl:
+                bx, by = bx.to(CONFIG['DEVICE']), by.to(CONFIG['DEVICE'])
+                optimizer.zero_grad()
+                pred = self.model(bx)
+                loss = criterion(pred, by)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
             
-            if self.is_cls:
-                day_res[f'alpha_{self.name}_score'] = vals
-            else:
-                for k in range(vals.shape[1]): day_res[f'alpha_{self.name}_{k:03d}'] = vals[:, k]
+            # 验证环节：直接跑模拟交易 (使用最新的一天数据)
+            valid_pnl = SimTrader.run_simulation(self.model, valid_dfs[-1], self.feat_cols)
             
-            all_results_df.append(day_res)
+            save_mark = ""
+            if valid_pnl > best_pnl:
+                best_pnl = valid_pnl
+                torch.save(self.model.state_dict(), "best_model.pth")
+                save_mark = "🏆 New Best!"
             
-        return pd.concat(all_results_df, axis=0)
+            avg_loss = total_loss / len(train_dl)
+            print(f"Epoch {epoch+1:02d} | W-Loss: {avg_loss:.6f} | Sim PnL: {valid_pnl:.2f} {save_mark}")
+            
+        if os.path.exists("best_model.pth"):
+            self.model.load_state_dict(torch.load("best_model.pth"))
+            os.remove("best_model.pth")
+            
+        return best_pnl
 
 # ==============================================================================
-# 5. 主流程 (Multi-Day Pipeline)
+# 5. 主程序 (Main Pipeline)
 # ==============================================================================
 def main():
-    # 1. 扫描所有日期文件
+    # 1. 扫描所有日期文件 (恢复原始的 get_daily_files 逻辑)
     print(f"📂 扫描数据目录: {CONFIG['DATA_DIR']} ...")
-    main_files = DataLoaderService.get_daily_files(CONFIG['MAIN_SYMBOL'])
-    aux_files = DataLoaderService.get_daily_files(CONFIG['AUX_SYMBOL'])
+    main_files_map = DataLoaderService.get_daily_files(CONFIG['MAIN_SYMBOL'])
+    aux_files_map = DataLoaderService.get_daily_files(CONFIG['AUX_SYMBOL'])
     
     # 找交集日期
-    common_dates = sorted(list(set(main_files.keys()) & set(aux_files.keys())))
+    common_dates = sorted(list(set(main_files_map.keys()) & set(aux_files_map.keys())))
     
-    # --- 滚动窗口逻辑 (Rolling Window) ---
-    if len(common_dates) > CONFIG['ROLLING_WINDOW_SIZE']:
-        print(f"✂️ 数据超过 {CONFIG['ROLLING_WINDOW_SIZE']} 天，进行滚动截断...")
-        training_dates = common_dates[-CONFIG['ROLLING_WINDOW_SIZE']:]
-    else:
-        training_dates = common_dates
-        
-    print(f"✅ 最终纳入计算日期: {training_dates[0]} ~ {training_dates[-1]} (共 {len(training_dates)} 天)")
-    
-    if not training_dates:
-        print("❌ 没有找到有效数据文件")
+    if len(common_dates) < 2:
+        print(f"❌ 数据不足! 仅找到 {len(common_dates)} 个有效日期对。需要至少 2 天 (1 Train + 1 Valid)。")
+        print(f"   Debug: Main Keys: {list(main_files_map.keys())[:5]}")
         return
 
-    # 2. 逐日加载、合并、注入因子 (预处理)
-    daily_df_list = []
-    manual_gen = ManualFactorGenerator()
+    # 2. N-1 滚动切分
+    if len(common_dates) < 60:
+        split_idx = len(common_dates) - 1 
+    else:
+        split_idx = len(common_dates) - 5 
+        
+    train_dates = common_dates[:split_idx]
+    valid_dates = common_dates[split_idx:]
     
-    print("\n⚡ [Preprocessing] 逐日清洗与因子注入...")
-    for date in training_dates:
-        f_main = main_files[date]
-        f_aux = aux_files[date]
+    print(f"📅 训练集: {len(train_dates)} 天 | 验证集: {len(valid_dates)} 天 ({valid_dates[0]}~{valid_dates[-1]})")
+    
+    gen = ManualFactorGenerator()
+    train_dfs = []
+    valid_dfs = []
+    first_df = None
+    
+    print("⚡ 加载数据中...")
+    for date in common_dates:
+        f_m = main_files_map[date]
+        f_a = aux_files_map[date]
         
-        df_m = DataLoaderService.load_single_day(f_main, is_aux=False)
-        df_a = DataLoaderService.load_single_day(f_aux, is_aux=True)
+        df_m = DataLoaderService.load_single_day(f_m, False)
+        df_a = DataLoaderService.load_single_day(f_a, True)
         
-        if df_m is None or df_a is None: continue
-        
-        df_day = df_m.join(df_a, how='inner')
-        if len(df_day) < 200: continue 
-        
-        df_manual = manual_gen.process(df_day)
-        df_final = df_day.join(df_manual, how='inner')
-        
-        daily_df_list.append(df_final)
-        
-    print(f"📊 预处理完成，有效天数: {len(daily_df_list)}")
-    if not daily_df_list: return
+        if df_m is not None and df_a is not None:
+            df = df_m.join(df_a, how='inner')
+            df_feat = gen.process(df)
+            df_final = df.join(df_feat, how='inner').dropna()
+            
+            if date in train_dates: train_dfs.append(df_final)
+            else: valid_dfs.append(df_final)
+            
+            if first_df is None: first_df = df_final
 
     # 3. 确定特征列表
-    sample_df = daily_df_list[0]
-    excludes = ['tx_server_time', 'datetime']
-    feats = [c for c in sample_df.columns if c not in excludes and np.issubdtype(sample_df[c].dtype, np.number)]
-    print(f"🔹 模型特征维度: {len(feats)}")
+    feat_cols = [c for c in first_df.columns if c.startswith('feat_')]
+    if 'feat_time_norm' in feat_cols:
+        feat_cols.remove('feat_time_norm')
+        feat_cols.append('feat_time_norm') # 确保时间特征在最后
 
-    # 4. 检查是否有旧模型 (用于热启动)
-    pretrained_path = CONFIG['ARTIFACT_NAME'] if os.path.exists(CONFIG['ARTIFACT_NAME']) else None
-    
-    # 5. 初始化模型管理器
-    dir_mgr = DeepModelManager("direction", Direction, feats, lookback=CONFIG['MAX_LOOKBACK'], is_cls=True)
-    miner_mgr = DeepModelManager("miner", HybridMinerNet, feats, lookback=60, n_factors=128, is_cls=False)
+    print(f"🔹 特征维度: {len(feat_cols)}")
 
-    # 6. 训练与推理 (Production Mode = True)
-    # 传入 pretrained_path 尝试进行微调
-    res_dir = dir_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=True)#注意回测改这里
-    res_miner = miner_mgr.process(daily_df_list, pretrained_path=pretrained_path, production_mode=True)#还有这里
+    # 4. 训练与验证
+    mgr = DeepModelManager(feat_cols)
+    final_pnl = mgr.run(train_dfs, valid_dfs)
     
-    # 7. 手工因子合并
-    manual_cols = [c for c in sample_df.columns if c.startswith('alpha_') or c.startswith('logic_')]
-    res_manual_list = [day[manual_cols].iloc[CONFIG['MAX_LOOKBACK']:] for day in daily_df_list]
-    res_manual = pd.concat(res_manual_list, axis=0)
+    print(f"\n✅ 最终模型 PnL (验证集): {final_pnl:.2f}")
 
-    # 8. 最终合并与筛选
-    final_df = pd.concat([res_dir, res_miner, res_manual], axis=1).dropna()
-    
-    # 构造 Target 计算 IC
-    target_list = []
-    for day in daily_df_list:
-        t = day['log_ret'].shift(-20).iloc[CONFIG['MAX_LOOKBACK']:]
-        target_list.append(t)
-    target = pd.concat(target_list, axis=0).reindex(final_df.index).fillna(0)
-    
-    print("\n🔍 计算 IC 并筛选...")
-    ic_map = {}
-    for c in final_df.columns:
-        if final_df[c].std() == 0: continue
-        corr = spearmanr(final_df[c].values, target.values)[0]
-        if not np.isnan(corr): ic_map[c] = abs(corr)
-    
-    selected_factors = sorted(ic_map.keys(), key=lambda x: ic_map[x], reverse=True)[:135]
-    final_output = final_df[selected_factors]
-
-    # 9. 保存成果
-    strategy_artifact = {
+    # 5. 保存成果
+    artifact = {
         'meta': {
-            'description': 'Multi-Day Hybrid Strategy (Rolling Updated)',
-            'train_dates': training_dates,
-            'rolling_window': CONFIG['ROLLING_WINDOW_SIZE'],
-            'input_feature_count': len(feats),
-            'output_factor_count': len(selected_factors)
+            'features': feat_cols,
+            'horizon': CONFIG['HORIZON'],
+            'threshold': CONFIG['COST_THRESHOLD']
         },
-        'features': {'input_names': feats, 'output_names': selected_factors},
-        'models': {
-            'direction_state_dict': dir_mgr.trained_model.state_dict(),
-            'direction_scaler': dir_mgr.trained_scaler,
-            'miner_state_dict': miner_mgr.trained_model.state_dict(),
-            'miner_scaler': miner_mgr.trained_scaler,
-        }
+        'state_dict': mgr.model.state_dict()
     }
-    
-    torch.save(strategy_artifact, CONFIG['ARTIFACT_NAME'])
-    final_output.to_csv(CONFIG['FACTOR_LIB_NAME'])
-    
-    print(f"\n✅ 全部完成! 已更新模型并保存因子库。")
+    torch.save(artifact, CONFIG['ARTIFACT_NAME'])
+    pd.Series(feat_cols).to_csv(CONFIG['FACTOR_LIB_NAME'], index=False, header=False)
 
 if __name__ == "__main__":
     main()
