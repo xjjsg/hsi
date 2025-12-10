@@ -33,7 +33,7 @@ CONFIG = {
     
     # --- 资金管理回测 ---
     'TRADE_COST': 0.0001,          # [关键] 单边万1成本
-    'INITIAL_CAPITAL': 20000,      # 初始本金 2万
+    'INITIAL_CAPITAL': 200000,      # 初始本金 2万
     'CONF_THRESHOLD': 0.75,        # [关键] 70% 把握即开仓
     'MAX_POSITION': 0.9,           # 最大仓位 80%
     
