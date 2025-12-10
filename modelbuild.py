@@ -1,16 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Alpha System v8.1 - Final Stable Edition
-----------------------------------------
-功能全集：
-1. [修复] 彻底解决 classification_report 的 KeyError 问题。
-2. [参数] 适配单边万1成本，训练门槛 0.0015。
-3. [模型] 集成 SE-Block + Inception + Temporal Attention。
-4. [风控] 资金管理回测，置信度 > 0.7 才开仓。
-
-@Ver: 8.1 Stable
-"""
-
 import os
 import glob
 import warnings
@@ -47,11 +34,11 @@ CONFIG = {
     # --- 资金管理回测 ---
     'TRADE_COST': 0.0001,          # [关键] 单边万1成本
     'INITIAL_CAPITAL': 20000,      # 初始本金 2万
-    'CONF_THRESHOLD': 0.70,        # [关键] 70% 把握即开仓
-    'MAX_POSITION': 0.8,           # 最大仓位 80%
+    'CONF_THRESHOLD': 0.75,        # [关键] 70% 把握即开仓
+    'MAX_POSITION': 0.9,           # 最大仓位 80%
     
     # --- 训练参数 ---
-    'BATCH_SIZE': 256,             # 显存允许可调大
+    'BATCH_SIZE': 512,             # 显存允许可调大
     'EPOCHS': 50,
     'LR': 1e-4,
     'WEIGHT_DECAY': 1e-4,          # 强正则化防止过拟合
@@ -78,8 +65,8 @@ class AlphaForge:
         train_pairs = pairs[:-1]
         test_pair = pairs[-1]
         
-        print(f"📅 训练集: {train_pairs[0][0]} ~ {train_pairs[-1][0]}")
-        print(f"📅 测试集: {test_pair[0]}")
+        print(f"训练集: {train_pairs[0][0]} ~ {train_pairs[-1][0]}")
+        print(f"测试集: {test_pair[0]}")
         
         train_df = self._process_batch(train_pairs)
         test_df = self._process_batch([test_pair])
@@ -306,8 +293,7 @@ class HybridDeepLOB(nn.Module):
 class ETFDataset(Dataset):
     def __init__(self, df, lookback, scaler=None):
         self.lookback = lookback
-        lob_cols = [f'{s}{i}' for i in range(1,6) for s in ['bp','sp']] + \
-                   [f'{s}{i}' for i in range(1,6) for s in ['bv','sv']]
+        lob_cols = [f'{s}{i}' for i in range(1,6) for s in ['bp','sp']] + [f'{s}{i}' for i in range(1,6) for s in ['bv','sv']]
         exp_cols = [c for c in df.columns if c.startswith('feat_') or c.startswith('meta_')]
         
         mid = df['mid'].values.reshape(-1, 1)
@@ -378,9 +364,9 @@ def backtest_evaluate(model, dataloader, cfg):
                 
     pnl_abs = cash - initial_cap
     print("\n" + "="*40)
-    print(f"💰 [资金回测] 初始: {initial_cap:.0f} (成本万{int(cost*10000)})")
+    print(f"[资金回测] 初始: {initial_cap:.0f} (成本万{int(cost*10000)})")
     if total_trades == 0:
-        print("⚠️ 无交易 (信号太弱)")
+        print("无交易 (信号太弱)")
         return 0.0
         
     print(f"最终净值: {cash:.2f}")
@@ -401,12 +387,12 @@ def train_system():
     try:
         train_df, test_df = forge.load_and_split()
     except Exception as e:
-        print(f"❌ 数据加载失败: {e}")
+        print(f"数据加载失败: {e}")
         return
 
     # 标签分布 & 健壮权重计算
     c = np.bincount(train_df['label'].astype(int), minlength=3)
-    print(f"📊 标签分布: {c}")
+    print(f"标签分布: {c}")
     
     ds_train = ETFDataset(train_df, CONFIG['LOOKBACK'])
     ds_test = ETFDataset(test_df, CONFIG['LOOKBACK'], scaler=ds_train.scaler)
@@ -420,7 +406,7 @@ def train_system():
     w_buy = min((c[0]/(c[1]+1)) * 0.5, 10.0) 
     w_sell = min((c[0]/(c[2]+1)) * 0.5, 10.0)
     weights = torch.tensor([w_hold, w_buy, w_sell], dtype=torch.float32).to(CONFIG['DEVICE'])
-    print(f"⚖️ 使用权重: {weights.cpu().numpy()}")
+    print(f"使用权重: {weights.cpu().numpy()}")
     
     criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['LR'], weight_decay=CONFIG['WEIGHT_DECAY'])
@@ -456,7 +442,7 @@ def train_system():
                 patience += 1
                 print(f"   -> 未提升 ({patience}/{max_patience})")
                 if patience >= max_patience:
-                    print("🛑 早停.")
+                    print("早停.")
                     break
 
 if __name__ == "__main__":
