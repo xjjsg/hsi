@@ -28,12 +28,12 @@ CONFIG = {
     'LOOKBACK': 60,                # 回看窗口 180秒
     
     # [参数调整] 训练打标门槛 0.0015
-    'COST_THRESHOLD': 0.002,   
+    'COST_THRESHOLD': 0.0012,   
     
     # --- 资金管理回测 ---
     'TRADE_COST': 0.0001,          # 单边万1成本
     'INITIAL_CAPITAL': 200000,      # 初始本金 20万
-    'CONF_THRESHOLD': 0.4,        # 75% 把握即开仓
+    'CONF_THRESHOLD': 0.55,        # 75% 把握即开仓
     'MAX_POSITION': 0.9,           # 最大仓位 90%
     
     # --- 训练参数 ---
@@ -339,11 +339,15 @@ class ETFDataset(Dataset):
 
 def backtest_evaluate(model, dataloader, cfg, raw_df=None):
     """
-    [升级版] 真实实盘逻辑回测引擎 (带详细交易记录)
+    [升级版] 真实实盘逻辑回测引擎
+    特性：
+    1. 交易日志输出到文件 (backtest_log.txt)，解决终端刷屏问题
+    2. 对手价成交 (Ask买/Bid卖)
+    3. 每日收盘前(14:55)强制清仓
     """
     model.eval()
     
-    # --- 阶段一：全量推理 (获取所有时间点的预测概率) ---
+    # --- 阶段一：全量推理 ---
     all_probs = []
     with torch.no_grad():
         for x_lob, x_exp, _, _ in dataloader:
@@ -357,20 +361,27 @@ def backtest_evaluate(model, dataloader, cfg, raw_df=None):
     probs_stream = np.concatenate(all_probs, axis=0)
     
     valid_len = len(probs_stream)
-    if raw_df is None:
-        print("⚠️ 警告: 缺少原始 DataFrame，无法进行实盘模拟")
-        return 0.0
+    if raw_df is None: return 0.0
         
-    # 对齐价格数据和时间索引
+    # 对齐数据
     sim_df = raw_df.iloc[-valid_len:].copy()
-    prices = sim_df['mid'].values
-    # 尝试获取时间戳，兼容索引或列
-    if 'datetime' in sim_df.columns:
-        times = sim_df['datetime'].values
-    else:
-        times = sim_df.index.values
     
-    # --- 阶段二：事件驱动模拟 (Event-Driven Simulation) ---
+    # 提取关键列 (对手价)
+    ask_prices = sim_df['sp1'].values # 卖一价 (买入用)
+    bid_prices = sim_df['bp1'].values # 买一价 (卖出用)
+    last_prices = sim_df['price'].values
+    
+    # 时间处理
+    if 'datetime' in sim_df.columns:
+        raw_times = pd.to_datetime(sim_df['datetime'].values)
+    else:
+        raw_times = pd.to_datetime(sim_df.index.values)
+        
+    # 计算每日收盘强制平仓标志 (14:55 之后)
+    eod_flags = (raw_times.hour == 14) & (raw_times.minute >= 55)
+    
+    times_str = raw_times.strftime('%Y-%m-%d %H:%M:%S').values
+    
     cash = float(cfg['INITIAL_CAPITAL'])
     shares = 0.0
     initial_cap = cash
@@ -382,79 +393,118 @@ def backtest_evaluate(model, dataloader, cfg, raw_df=None):
     entry_price = 0.0
     is_holding = False
     
-    # 限制日志打印数量，避免刷屏
-    log_limit = 50
-    log_count = 0
+    # [修改] 准备日志文件
+    log_file = "backtest_log.txt"
     
-    print("\n  --- 交易日志 (最新50笔) ---")
-    
-    for t in range(valid_len):
-        current_price = prices[t]
-        current_time = str(times[t]) # 转换时间格式
-        p_hold, p_buy, p_sell = probs_stream[t]
+    # 使用 'w' 模式每次覆盖，如果想追加可用 'a'
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.write(f"=== 回测交易日志 (Start: {times_str[0]}) ===\n")
+        f.write(f"参数: Threshold={conf_thresh}, Cost={cost_rate}, EOD_Clear=14:55\n")
+        f.write("-" * 60 + "\n")
         
-        # 1. 信号判定
-        signal = 0; confidence = 0.0
-        if p_buy > p_hold and p_buy > p_sell and p_buy > conf_thresh:
-            signal = 1; confidence = p_buy
-        elif p_sell > p_hold and p_sell > p_buy and p_sell > conf_thresh:
-            signal = 2; confidence = p_sell
+        for t in range(valid_len):
+            curr_ask = ask_prices[t]
+            curr_bid = bid_prices[t]
             
-        # 2. 账户逻辑 (状态机)
-        if not is_holding:
-            # === 空仓状态 ===
-            if signal == 1: # 买入信号
-                scale = min((confidence - conf_thresh) / (1 - conf_thresh), max_pos)
-                budget = cash * scale
-                if budget > 2000:
-                    shares = budget / current_price * (1 - cost_rate)
-                    cash -= budget
-                    entry_price = current_price
-                    is_holding = True
+            # 数据清洗：如果盘口缺失，暂用最新价代替
+            if curr_ask <= 0: curr_ask = last_prices[t]
+            if curr_bid <= 0: curr_bid = last_prices[t]
+            
+            current_time = times_str[t]
+            p_hold, p_buy, p_sell = probs_stream[t]
+            
+            # ==========================================
+            # 每日收盘前强制风控
+            # ==========================================
+            if eod_flags[t]:
+                if is_holding:
+                    # 强平
+                    revenue = shares * curr_bid * (1 - cost_rate)
+                    raw_pnl = revenue - (shares * entry_price / (1 - cost_rate))
+                    pnl_pct = (curr_bid - entry_price) / entry_price
                     
-                    if log_count < log_limit:
-                        print(f"  [{current_time}] 🔴 BUY  @ {current_price:.4f} | Conf: {confidence:.2f}")
-                        log_count += 1
-        else:
-            # === 持仓状态 ===
-            pnl_pct = (current_price - entry_price) / entry_price
-            
-            # 平仓条件: 止损 / 信号消失 / 反转
-            stop_loss = pnl_pct < -0.008  # 0.8% 止损
-            signal_lost = p_buy < conf_thresh
-            reverse_signal = signal == 2
-            
-            if stop_loss or signal_lost or reverse_signal:
-                revenue = shares * current_price * (1 - cost_rate)
-                raw_pnl = revenue - (shares * entry_price / (1 - cost_rate))
+                    cash += revenue
+                    shares = 0.0
+                    is_holding = False
+                    trades += 1
+                    if raw_pnl > 0: wins += 1
+                    
+                    f.write(f"[{current_time}] 🟢 SELL @ {curr_bid:.4f} | PnL: {raw_pnl:+.2f} ({pnl_pct:.2%}) | Reason: EOD_Clear\n")
                 
-                cash += revenue
-                shares = 0.0
-                is_holding = False
-                trades += 1
-                if raw_pnl > 0: wins += 1
+                continue # 收盘时段跳过后续开仓判断
+            
+            # ==========================================
+            # 正常交易逻辑
+            # ==========================================
+            signal = 0; confidence = 0.0
+            if p_buy > p_hold and p_buy > p_sell and p_buy > conf_thresh:
+                signal = 1; confidence = p_buy
+            elif p_sell > p_hold and p_sell > p_buy and p_sell > conf_thresh:
+                signal = 2; confidence = p_sell
                 
-                if log_count < log_limit:
+            if not is_holding:
+                if signal == 1: 
+                    scale = min((confidence - conf_thresh) / (1 - conf_thresh), max_pos)
+                    budget = cash * scale
+                    if budget > 2000:
+                        # 用卖一价买入
+                        shares = budget / curr_ask * (1 - cost_rate)
+                        cash -= budget
+                        entry_price = curr_ask 
+                        is_holding = True
+                        
+                        f.write(f"[{current_time}] 🔴 BUY  @ {curr_ask:.4f} | Conf: {confidence:.2f}\n")
+            else:
+                pnl_pct = (curr_bid - entry_price) / entry_price
+                
+                stop_loss = pnl_pct < -0.008
+                signal_lost = p_buy < conf_thresh
+                reverse_signal = signal == 2
+                
+                if stop_loss or signal_lost or reverse_signal:
+                    # 用买一价卖出
+                    revenue = shares * curr_bid * (1 - cost_rate)
+                    raw_pnl = revenue - (shares * entry_price / (1 - cost_rate))
+                    
+                    cash += revenue
+                    shares = 0.0
+                    is_holding = False
+                    trades += 1
+                    if raw_pnl > 0: wins += 1
+                    
                     reason = "StopLoss" if stop_loss else ("RevSignal" if reverse_signal else "SigLost")
-                    print(f"  [{current_time}] 🟢 SELL @ {current_price:.4f} | PnL: {raw_pnl:+.2f} ({pnl_pct:.2%}) | {reason}")
-                    log_count += 1
+                    f.write(f"[{current_time}] 🟢 SELL @ {curr_bid:.4f} | PnL: {raw_pnl:+.2f} ({pnl_pct:.2%}) | Reason: {reason}\n")
 
-    # 模拟结束强制平仓结算
-    if is_holding:
-        cash += shares * prices[-1] * (1 - cost_rate)
+        # 模拟结束强制结算
+        if is_holding:
+            final_bid = bid_prices[-1] if bid_prices[-1] > 0 else last_prices[-1]
+            cash += shares * final_bid * (1 - cost_rate)
+            f.write(f"[{times_str[-1]}] 🟢 SELL @ {final_bid:.4f} | Reason: Simulation_End\n")
+            
+        final_pnl = cash - initial_cap
+        win_rate = wins / trades if trades > 0 else 0
         
-    final_pnl = cash - initial_cap
-    win_rate = wins / trades if trades > 0 else 0
-    
-    print("  -----------------------")
-    print(f"[实盘模拟引擎] 初始: {initial_cap:.0f} (成本万{int(cost_rate*10000)})")
+        # 写入摘要到文件末尾
+        summary = (
+            f"\n{'='*40}\n"
+            f"[最终结果]\n"
+            f"最终净值: {cash:.2f}\n"
+            f"收益率  : {(cash/initial_cap - 1)*100:.2f}%\n"
+            f"交易次数: {trades} | 胜率: {win_rate:.2%}\n"
+            f"{'='*40}\n"
+        )
+        f.write(summary)
+
+    # 终端只打印摘要
+    print("\n" + "="*40)
+    print(f"[实盘模拟引擎] 初始: {initial_cap:.0f}")
     print(f"最终净值: {cash:.2f}")
     print(f"收益率  : {(cash/initial_cap - 1)*100:.2f}%")
     print(f"交易次数: {trades} | 胜率: {win_rate:.2%}")
+    print(f"👉 详细日志已保存至: {log_file}")
     print("="*40)
     
     return final_pnl
-
 def train_system():
     forge = AlphaForge(CONFIG)
     try:
