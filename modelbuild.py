@@ -28,27 +28,26 @@ CONFIG = {
     'LOOKBACK': 60,                # 回看窗口 180秒
     
     # [参数调整] 训练打标门槛 0.0015
-    # 成本极低(0.0002)，0.0015 的波动足以产生丰厚利润，且样本量比 0.002 多
-    'COST_THRESHOLD': 0.0015,   
+    'COST_THRESHOLD': 0.002,   
     
     # --- 资金管理回测 ---
-    'TRADE_COST': 0.0001,          # [关键] 单边万1成本
-    'INITIAL_CAPITAL': 200000,      # 初始本金 2万
-    'CONF_THRESHOLD': 0.75,        # [关键] 70% 把握即开仓
-    'MAX_POSITION': 0.9,           # 最大仓位 80%
+    'TRADE_COST': 0.0001,          # 单边万1成本
+    'INITIAL_CAPITAL': 200000,      # 初始本金 20万
+    'CONF_THRESHOLD': 0.4,        # 75% 把握即开仓
+    'MAX_POSITION': 0.9,           # 最大仓位 90%
     
     # --- 训练参数 ---
-    'BATCH_SIZE': 512,             # 显存允许可调大
-    'EPOCHS': 50,
+    'BATCH_SIZE': 512,             
+    'EPOCHS': 100,
     'LR': 1e-4,
-    'WEIGHT_DECAY': 1e-4,          # 强正则化防止过拟合
+    'WEIGHT_DECAY': 1e-4,          # 强正则化
     'DEVICE': 'cuda' if torch.cuda.is_available() else 'cpu',
     'PATIENCE': 20,                # 早停耐心
     'WARMUP_EPOCHS': 10,           # 热身轮数
 }
 
 # ==========================================
-# 2. 数据工厂：Alpha Forge
+# 2. 数据工厂：Alpha Forge (含新增因子)
 # ==========================================
 class AlphaForge:
     def __init__(self, cfg):
@@ -122,8 +121,12 @@ class AlphaForge:
             'bv2': 'last', 'sv2': 'last', 'bv3': 'last', 'sv3': 'last',
             'bv4': 'last', 'sv4': 'last', 'bv5': 'last', 'sv5': 'last',
         }
-        for c in ['index_price', 'fut_price', 'fut_imb']:
-            if c in df_m.columns: agg[c] = 'last'
+        
+        # [新增] 确保核心 Alpha 因子源数据被读入
+        extra_cols = ['index_price', 'fut_price', 'fut_imb', 'premium_rate', 'sentiment', 'tick_vwap']
+        for c in extra_cols:
+            if c in df_m.columns: 
+                agg[c] = 'last'
             
         df_m = df_m.resample(self.cfg['RESAMPLE_FREQ']).agg(agg)
         df_a = df_a.resample(self.cfg['RESAMPLE_FREQ']).agg({'price': 'last', 'tick_vol': 'sum'})
@@ -144,6 +147,25 @@ class AlphaForge:
         wa = sum(df[f'sv{i}']*self.weights[i-1] for i in range(1,6))
         df['feat_micro_pressure'] = (wb - wa) / (wb + wa + 1e-8)
         
+        # [新增] 四大核心 Alpha 因子
+        # A. 折溢价率
+        if 'premium_rate' in df.columns:
+            df['feat_premium_rate'] = df['premium_rate']
+        elif 'index_price' in df.columns:
+            df['feat_premium_rate'] = (df['index_price'] - safe_mid) / safe_mid
+
+        # B. 情绪因子
+        if 'sentiment' in df.columns:
+            df['feat_sentiment'] = df['sentiment']
+            
+        # C. 期货盘口失衡
+        if 'fut_imb' in df.columns:
+            df['feat_fut_imb'] = df['fut_imb']
+            
+        # D. 资金流向力度 (Flow Force)
+        if 'tick_vwap' in df.columns and 'tick_vol' in df.columns:
+            df['feat_flow_force'] = (df['tick_vwap'] - df['mid']) * np.log1p(df['tick_vol'])
+            
         # 3. Oracle Factors
         if 'index_price' in df.columns:
             df['feat_oracle_basis'] = (df['index_price'] - safe_mid) / safe_mid
@@ -156,7 +178,6 @@ class AlphaForge:
         return df
 
     def _make_labels(self, df):
-        """Triple Barrier Method"""
         mid = df['mid']
         horizon = self.cfg['PREDICT_HORIZON']
         threshold = self.cfg['COST_THRESHOLD']
@@ -182,12 +203,12 @@ class AlphaForge:
             labels[conflict] = np.where(c_max > c_min, 1, 2)
             
         df['label'] = labels
-        # 保留真实未来收益 (保守回测用)
+        # 保留真实未来收益 (旧版回测用，新版用全量数据模拟)
         df['real_future_ret'] = mid.shift(-horizon) / mid - 1
         return df
 
 # ==========================================
-# 3. 高级模型组件 (Attention & SE)
+# 3. 高级模型组件 (Unchanged)
 # ==========================================
 class SEBlock(nn.Module):
     def __init__(self, channel, reduction=4):
@@ -242,7 +263,6 @@ class HybridDeepLOB(nn.Module):
         m_hid = 64
         l_hid = 128
         
-        # A. Visual Stream (Deep Compression)
         self.compress = nn.Sequential(
             nn.Conv2d(1, c_chan, (1, 2), stride=(1, 2)), nn.LeakyReLU(), nn.BatchNorm2d(c_chan),
             nn.Conv2d(c_chan, c_chan, (4, 1), padding='same'), nn.LeakyReLU(), nn.BatchNorm2d(c_chan),
@@ -252,12 +272,10 @@ class HybridDeepLOB(nn.Module):
         self.inception1 = InceptionBlock(c_chan, c_chan)
         self.inception2 = InceptionBlock(128, 64)
         
-        # B. Expert Stream
         self.expert = nn.Sequential(
             nn.Linear(num_expert, m_hid), nn.LeakyReLU(), nn.BatchNorm1d(m_hid), nn.Dropout(0.2)
         )
         
-        # C. Fusion & Temporal
         fusion_dim = 256 + m_hid
         self.lstm = nn.LSTM(fusion_dim, l_hid, num_layers=2, batch_first=True, dropout=0.5)
         self.attention = TemporalAttention(l_hid)
@@ -288,7 +306,7 @@ class HybridDeepLOB(nn.Module):
         return self.head(self.dropout(context))
 
 # ==========================================
-# 4. 训练引擎
+# 4. 训练与实盘模拟引擎
 # ==========================================
 class ETFDataset(Dataset):
     def __init__(self, df, lookback, scaler=None):
@@ -319,68 +337,123 @@ class ETFDataset(Dataset):
         s, e = i, i + self.lookback
         return self.X_lob[s:e], self.X_exp[s:e], self.Y[e-1], self.raw_ret[e-1]
 
-def backtest_evaluate(model, dataloader, cfg):
+def backtest_evaluate(model, dataloader, cfg, raw_df=None):
+    """
+    [升级版] 真实实盘逻辑回测引擎 (带详细交易记录)
+    """
     model.eval()
+    
+    # --- 阶段一：全量推理 (获取所有时间点的预测概率) ---
+    all_probs = []
+    with torch.no_grad():
+        for x_lob, x_exp, _, _ in dataloader:
+            x_lob = x_lob.to(cfg['DEVICE'])
+            x_exp = x_exp.to(cfg['DEVICE'])
+            logits = model(x_lob, x_exp)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            all_probs.append(probs)
+    
+    if not all_probs: return 0.0
+    probs_stream = np.concatenate(all_probs, axis=0)
+    
+    valid_len = len(probs_stream)
+    if raw_df is None:
+        print("⚠️ 警告: 缺少原始 DataFrame，无法进行实盘模拟")
+        return 0.0
+        
+    # 对齐价格数据和时间索引
+    sim_df = raw_df.iloc[-valid_len:].copy()
+    prices = sim_df['mid'].values
+    # 尝试获取时间戳，兼容索引或列
+    if 'datetime' in sim_df.columns:
+        times = sim_df['datetime'].values
+    else:
+        times = sim_df.index.values
+    
+    # --- 阶段二：事件驱动模拟 (Event-Driven Simulation) ---
     cash = float(cfg['INITIAL_CAPITAL'])
+    shares = 0.0
     initial_cap = cash
-    cost = cfg['TRADE_COST']
+    cost_rate = cfg['TRADE_COST']
     conf_thresh = cfg['CONF_THRESHOLD']
     max_pos = cfg['MAX_POSITION']
     
-    total_trades = 0; wins = 0
-    all_preds, all_labels = [], []
+    trades = 0; wins = 0
+    entry_price = 0.0
+    is_holding = False
     
-    with torch.no_grad():
-        for x_lob, x_exp, y, real_ret in dataloader:
-            x_lob, x_exp = x_lob.to(cfg['DEVICE']), x_exp.to(cfg['DEVICE'])
-            logits = model(x_lob, x_exp)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
-            y = y.numpy(); real_ret = real_ret.numpy()
-            
-            for i in range(len(probs)):
-                p_hold, p_buy, p_sell = probs[i]
-                signal = 0; confidence = 0.0
-                
-                if p_buy > p_hold and p_buy > p_sell and p_buy > conf_thresh:
-                    signal = 1; confidence = p_buy
-                elif p_sell > p_hold and p_sell > p_buy and p_sell > conf_thresh:
-                    signal = 2; confidence = p_sell
-                
-                all_preds.append(signal)
-                all_labels.append(y[i])
-                
-                if signal == 0: continue
-                
-                scale = (confidence - conf_thresh) / (1 - conf_thresh)
-                scale = min(scale, max_pos)
-                trade_val = cash * scale
-                if trade_val < 2000: continue
-                
-                direction = 1 if signal == 1 else -1
-                pnl = trade_val * (direction * real_ret[i] - 2 * cost)
-                cash += pnl
-                total_trades += 1
-                if pnl > 0: wins += 1
-                
-    pnl_abs = cash - initial_cap
-    print("\n" + "="*40)
-    print(f"[资金回测] 初始: {initial_cap:.0f} (成本万{int(cost*10000)})")
-    if total_trades == 0:
-        print("无交易 (信号太弱)")
-        return 0.0
+    # 限制日志打印数量，避免刷屏
+    log_limit = 50
+    log_count = 0
+    
+    print("\n  --- 交易日志 (最新50笔) ---")
+    
+    for t in range(valid_len):
+        current_price = prices[t]
+        current_time = str(times[t]) # 转换时间格式
+        p_hold, p_buy, p_sell = probs_stream[t]
         
+        # 1. 信号判定
+        signal = 0; confidence = 0.0
+        if p_buy > p_hold and p_buy > p_sell and p_buy > conf_thresh:
+            signal = 1; confidence = p_buy
+        elif p_sell > p_hold and p_sell > p_buy and p_sell > conf_thresh:
+            signal = 2; confidence = p_sell
+            
+        # 2. 账户逻辑 (状态机)
+        if not is_holding:
+            # === 空仓状态 ===
+            if signal == 1: # 买入信号
+                scale = min((confidence - conf_thresh) / (1 - conf_thresh), max_pos)
+                budget = cash * scale
+                if budget > 2000:
+                    shares = budget / current_price * (1 - cost_rate)
+                    cash -= budget
+                    entry_price = current_price
+                    is_holding = True
+                    
+                    if log_count < log_limit:
+                        print(f"  [{current_time}] 🔴 BUY  @ {current_price:.4f} | Conf: {confidence:.2f}")
+                        log_count += 1
+        else:
+            # === 持仓状态 ===
+            pnl_pct = (current_price - entry_price) / entry_price
+            
+            # 平仓条件: 止损 / 信号消失 / 反转
+            stop_loss = pnl_pct < -0.008  # 0.8% 止损
+            signal_lost = p_buy < conf_thresh
+            reverse_signal = signal == 2
+            
+            if stop_loss or signal_lost or reverse_signal:
+                revenue = shares * current_price * (1 - cost_rate)
+                raw_pnl = revenue - (shares * entry_price / (1 - cost_rate))
+                
+                cash += revenue
+                shares = 0.0
+                is_holding = False
+                trades += 1
+                if raw_pnl > 0: wins += 1
+                
+                if log_count < log_limit:
+                    reason = "StopLoss" if stop_loss else ("RevSignal" if reverse_signal else "SigLost")
+                    print(f"  [{current_time}] 🟢 SELL @ {current_price:.4f} | PnL: {raw_pnl:+.2f} ({pnl_pct:.2%}) | {reason}")
+                    log_count += 1
+
+    # 模拟结束强制平仓结算
+    if is_holding:
+        cash += shares * prices[-1] * (1 - cost_rate)
+        
+    final_pnl = cash - initial_cap
+    win_rate = wins / trades if trades > 0 else 0
+    
+    print("  -----------------------")
+    print(f"[实盘模拟引擎] 初始: {initial_cap:.0f} (成本万{int(cost_rate*10000)})")
     print(f"最终净值: {cash:.2f}")
-    print(f"交易次数: {total_trades} | 胜率: {wins/total_trades:.2%}")
-    
-    # [修复] 安全获取 Precision，防止 Key Error
-    rep = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
-    buy_prec = rep.get('1', {}).get('precision', 0.0)
-    sell_prec = rep.get('2', {}).get('precision', 0.0)
-    
-    print(f"Buy Precision: {buy_prec:.2f}")
-    print(f"Sell Precision: {sell_prec:.2f}")
+    print(f"收益率  : {(cash/initial_cap - 1)*100:.2f}%")
+    print(f"交易次数: {trades} | 胜率: {win_rate:.2%}")
     print("="*40)
-    return pnl_abs
+    
+    return final_pnl
 
 def train_system():
     forge = AlphaForge(CONFIG)
@@ -390,21 +463,21 @@ def train_system():
         print(f"数据加载失败: {e}")
         return
 
-    # 标签分布 & 健壮权重计算
     c = np.bincount(train_df['label'].astype(int), minlength=3)
     print(f"标签分布: {c}")
     
     ds_train = ETFDataset(train_df, CONFIG['LOOKBACK'])
+    # 注意：dl_test 需要 shuffle=False 才能保证时间顺序
     ds_test = ETFDataset(test_df, CONFIG['LOOKBACK'], scaler=ds_train.scaler)
     dl_train = DataLoader(ds_train, CONFIG['BATCH_SIZE'], shuffle=True)
     dl_test = DataLoader(ds_test, CONFIG['BATCH_SIZE'], shuffle=False)
     
     model = HybridDeepLOB(ds_train.X_exp.shape[1]).to(CONFIG['DEVICE'])
     
-    # 权重策略
+    # 类别权重
     w_hold = 1.0
-    w_buy = min((c[0]/(c[1]+1)) * 0.5, 10.0) 
-    w_sell = min((c[0]/(c[2]+1)) * 0.5, 10.0)
+    w_buy = c[0]/(c[1]+1)
+    w_sell = c[0]/(c[2]+1)
     weights = torch.tensor([w_hold, w_buy, w_sell], dtype=torch.float32).to(CONFIG['DEVICE'])
     print(f"使用权重: {weights.cpu().numpy()}")
     
@@ -430,7 +503,9 @@ def train_system():
             loss_sum += loss.item()
             
         print(f"Epoch {epoch+1} | Loss: {loss_sum/len(dl_train):.4f}")
-        pnl = backtest_evaluate(model, dl_test, CONFIG)
+        
+        # [修改] 传入 raw_df=test_df 供事件驱动回测使用
+        pnl = backtest_evaluate(model, dl_test, CONFIG, raw_df=test_df)
         
         if pnl > best_pnl:
             best_pnl = pnl
