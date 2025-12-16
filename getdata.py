@@ -6,19 +6,23 @@ import os
 import time
 import sys
 import json
+import math
 import numpy as np
 from datetime import datetime, time as dt_time
+from collections import defaultdict
 from playwright.async_api import async_playwright, Browser
 
 # ================= 配置区域 =================
 
+# [修改] 增加 delay 字段，用于监控数据延迟
 CSV_HEADER_BASE = [
     "symbol", 
     "tx_server_time", "tx_local_time", "bd_server_time", "bd_local_time",
     "price", "iopv", "premium_rate", "index_price", "fx_rate", "sentiment",
     "tick_vol", "tick_amt", "tick_vwap", "interval_s",
     "bp1", "bv1", "bp2", "bv2", "bp3", "bv3", "bp4", "bv4", "bp5", "bv5",
-    "sp1", "sv1", "sp2", "sv2", "sp3", "sv3", "sp4", "sv4", "sp5", "sv5"
+    "sp1", "sv1", "sp2", "sv2", "sp3", "sv3", "sp4", "sv4", "sp5", "sv5",
+    "idx_delay_ms", "fut_delay_ms", "data_flags" # [新增] 延迟监控与数据标记(0=正常, 1=重置/异常)
 ]
 
 CSV_HEADER_FUTURES = [
@@ -61,22 +65,25 @@ HSTECH_WEIGHTS = {
     '01024': 6.0,  '02015': 5.0,  '09961': 4.0,  '00999': 3.5, '00981': 3.0
 }
 
-# ================= 全局缓存 =================
+# [新增] 全局错误计数器
+ERROR_COUNTERS = defaultdict(int)
+
+# ================= 全局缓存 (带接收时间戳) =================
 
 GLOBAL_INDEX_CACHE = {
-    "HSI":    {"price": 0.0, "server_time": "N/A", "local_time": 0},
-    "HZ2083": {"price": 0.0, "server_time": "N/A", "local_time": 0}
+    "HSI":    {"price": 0.0, "server_time": "N/A", "local_time": 0, "recv_time": 0},
+    "HZ2083": {"price": 0.0, "server_time": "N/A", "local_time": 0, "recv_time": 0}
 }
 
 GLOBAL_FUTURES_CACHE = {
     "HSI": {
         "local_time": "N/A", "tick_time": "N/A", "price": 0.0, 
-        "mid": 0.0, "imb": 0.0, "delta_vol": 0, "pct": 0.0
+        "mid": 0.0, "imb": 0.0, "delta_vol": 0, "pct": 0.0, "recv_time": 0
     }
 }
 
-GLOBAL_FX_CACHE = {"price": 0.92, "time": "N/A"}
-GLOBAL_SENTIMENT_CACHE = {"HSI": 0.0, "HSTECH": 0.0}
+GLOBAL_FX_CACHE = {"price": 0.92, "time": "N/A", "recv_time": 0}
+GLOBAL_SENTIMENT_CACHE = {"HSI": 0.0, "HSTECH": 0.0, "recv_time": 0}
 
 # ==============================================================================
 #                           MODULE: SENTIMENT ALGORITHM
@@ -104,11 +111,18 @@ class SingleStockCalculator:
             
         delta_vol = curr_vol - self.last_vol
         delta_amt = curr_amt - self.last_amt
+        
+        # [修改] 防止负成交量（重置保护）
+        if delta_vol < 0:
+            self.last_vol = curr_vol
+            self.last_amt = curr_amt
+            return self.score_ema # 保持上一次分数
+
         self.last_vol = curr_vol
         self.last_amt = curr_amt
         
-        if delta_vol <= 0:
-            self.score_ema *= 0.95
+        if delta_vol == 0:
+            self.score_ema *= 0.98 # 缓慢衰减
             return self.score_ema
             
         vwap_3s = delta_amt / delta_vol
@@ -202,9 +216,13 @@ class SentimentWorker:
                     for code, weight in self.hstech_norm_weights.items():
                         if code in stock_scores: hstech_final += stock_scores[code] * weight
 
-                    GLOBAL_SENTIMENT_CACHE["HSI"] = round(np.tanh(hsi_final * 0.25) * 10, 4)
-                    GLOBAL_SENTIMENT_CACHE["HSTECH"] = round(np.tanh(hstech_final * 0.25) * 10, 4)
-                except Exception:
+                    # [修改] 使用 math.tanh 替代 np.tanh 提速，并记录接收时间
+                    GLOBAL_SENTIMENT_CACHE["HSI"] = round(math.tanh(hsi_final * 0.25) * 10, 4)
+                    GLOBAL_SENTIMENT_CACHE["HSTECH"] = round(math.tanh(hstech_final * 0.25) * 10, 4)
+                    GLOBAL_SENTIMENT_CACHE["recv_time"] = time.time()
+                    
+                except Exception as e:
+                    ERROR_COUNTERS["sentiment"] += 1
                     pass
                 elapsed = time.time() - start_ts
                 await asyncio.sleep(max(0, 1.0 - elapsed))
@@ -234,20 +252,15 @@ class TencentETFWorker:
         # 1. 早盘
         if self.T1_START <= now <= self.T1_END:
             return True
-            
-        # 2. 午盘瞬时 (12:00:10)
-        # 由于循环约1秒一次，只要秒数匹配即可
+        # 2. 午盘瞬时
         if now.hour == self.T2_INSTANT_H and now.minute == self.T2_INSTANT_M and now.second == self.T2_INSTANT_S:
             return True
-            
         # 3. 尾盘
         if self.T3_START <= now <= self.T3_END:
             return True
-            
         return False
 
     def get_paths(self, symbol):
-        """生成数据文件和错误日志的路径"""
         today_str = datetime.now().strftime("%Y-%m-%d")
         dir_path = os.path.join("data", symbol)
         os.makedirs(dir_path, exist_ok=True)
@@ -258,6 +271,8 @@ class TencentETFWorker:
 
     def parse_line(self, line: str):
         error_log = None 
+        data_flag = 0 # 0=正常, 1=重置/异常
+        
         try:
             tx_local_ts_float = time.time()
             tx_local_time = int(tx_local_ts_float * 1000) 
@@ -283,13 +298,25 @@ class TencentETFWorker:
             tick_amt = 0
             interval_s = 0.0
             
+            # [修改] 关键修复：检测成交量倒挂（重置）
             if raw_symbol in self.last_snapshot:
                 last = self.last_snapshot[raw_symbol]
-                tick_vol = total_vol - last['vol']
-                tick_amt = total_amt - last['amt']
+                
+                if total_vol < last['vol'] or total_amt < last['amt']:
+                    # 数据源重置，当前tick归零
+                    tick_vol = 0
+                    tick_amt = 0
+                    data_flag = 1 # 标记为重置
+                    error_log = f"[{datetime.now().strftime('%H:%M:%S')}] Volume Reset: {raw_symbol}\n"
+                else:
+                    tick_vol = total_vol - last['vol']
+                    tick_amt = total_amt - last['amt']
+                    
                 interval_s = tx_local_ts_float - last['local_ts_float']
+            else:
+                data_flag = 1 # 第一帧也是特殊帧
             
-            # 【重要】无论是否记录，必须更新 last_snapshot，保证 vol 差值计算正确
+            # 更新快照
             self.last_snapshot[raw_symbol] = {
                 'vol': total_vol, 'amt': total_amt, 'local_ts_float': tx_local_ts_float
             }
@@ -305,11 +332,18 @@ class TencentETFWorker:
             index_price = cached_idx.get("price", 0.0)
             bd_server_time = cached_idx.get("server_time", "N/A")
             bd_local_time = cached_idx.get("local_time", 0)
+            
+            # [新增] 计算指数数据延迟
+            idx_recv_time = cached_idx.get("recv_time", 0)
+            idx_delay_ms = int((tx_local_ts_float - idx_recv_time) * 1000) if idx_recv_time > 0 else 99999
 
-            # 异常检查
+            # [修改] Index 为 0 时写空字符串，避免污染训练数据
+            index_price_val = index_price if index_price > 0 else ""
+
             if index_price == 0 or index_price is None:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                error_log = f"[{timestamp}] Index=0 for {raw_symbol}. Raw Line: {line.strip()}\n"
+                if ERROR_COUNTERS["zero_index"] % 100 == 0:
+                    error_log = f"[{datetime.now().strftime('%H:%M:%S')}] Index=0 for {raw_symbol}\n"
+                ERROR_COUNTERS["zero_index"] += 1
 
             iopv = float(f[78]) if f[78] else 0.0
             premium_rate = (price - iopv) / iopv * 100 if iopv > 0 else 0.0
@@ -322,12 +356,13 @@ class TencentETFWorker:
             row = [
                 raw_symbol,
                 tx_server_time, tx_local_time, bd_server_time, bd_local_time,
-                price, iopv, round(premium_rate, 4), index_price, fx_rate, sentiment_score,
+                price, iopv, round(premium_rate, 4), index_price_val, fx_rate, sentiment_score,
                 int(tick_vol), int(tick_amt), round(tick_vwap, 4), round(interval_s, 3),
                 f[9], safe_int_vol(10), f[11], safe_int_vol(12), 
                 f[13], safe_int_vol(14), f[15], safe_int_vol(16), f[17], safe_int_vol(18),
                 f[19], safe_int_vol(20), f[21], safe_int_vol(22), 
-                f[23], safe_int_vol(24), f[25], safe_int_vol(26), f[27], safe_int_vol(28)
+                f[23], safe_int_vol(24), f[25], safe_int_vol(26), f[27], safe_int_vol(28),
+                idx_delay_ms, 0, data_flag # 0 placeholder for fut_delay
             ]
 
             fut_print_info = "" 
@@ -335,7 +370,13 @@ class TencentETFWorker:
                 future_key = config.get("future_key", "")
                 cached_fut = GLOBAL_FUTURES_CACHE.get(future_key, {})
                 if not cached_fut:
-                    cached_fut = {"local_time":"N/A", "tick_time":"N/A", "price":0, "mid":0, "imb":0, "delta_vol":0, "pct":0}
+                    cached_fut = {"local_time":"N/A", "tick_time":"N/A", "price":0, "mid":0, "imb":0, "delta_vol":0, "pct":0, "recv_time":0}
+                
+                # [新增] 计算期货延迟
+                fut_recv_time = cached_fut.get("recv_time", 0)
+                fut_delay_ms = int((tx_local_ts_float - fut_recv_time) * 1000) if fut_recv_time > 0 else 99999
+                row[-2] = fut_delay_ms # 更新 fut_delay_ms
+                
                 row.extend([
                     cached_fut.get("local_time", "N/A"), cached_fut.get("tick_time", "N/A"),
                     cached_fut.get("price", 0), cached_fut.get("mid", 0), cached_fut.get("imb", 0),
@@ -344,18 +385,19 @@ class TencentETFWorker:
                 if cached_fut.get('price', 0) > 0:
                     fut_print_info = f" | Fut: {cached_fut.get('price')}"
 
-            # 仅在需要记录的时间段才打印，避免刷屏（可选，这里保持打印以便监控）
             current_time = datetime.now().strftime("%H:%M:%S")
-            print(f"[{current_time}] {raw_symbol} | P:{price} | Idx:{index_price} | Prem:{premium_rate:.2f}%{fut_print_info}")
+            # 简化打印，包含延迟信息
+            print(f"[{current_time}] {raw_symbol} | P:{price} | Dly:{idx_delay_ms}ms | Vol:{int(tick_vol)}")
 
             return raw_symbol, row, error_log
 
         except Exception as e:
-            # print(f"Parse Error: {e}")
+            ERROR_COUNTERS["parse"] += 1
+            if ERROR_COUNTERS["parse"] % 100 == 1:
+                print(f"Parse Error: {e}")
             return None, None, None
 
     async def run(self):
-        # 预先生成路径
         path_map = {} 
         for code, cfg in ETF_CONFIG.items():
             csv_path, err_path = self.get_paths(code)
@@ -372,34 +414,25 @@ class TencentETFWorker:
             while True:
                 start_ts = time.time()
                 try:
-                    # 1. 获取并解析数据
                     async with session.get(url) as resp:
                         text = await resp.text(encoding='gbk')
-                        
                     lines = text.strip().split(';')
-                    
-                    # 2. 检查是否在记录时间段
                     should_record = self.is_recording_time()
 
                     for line in lines:
                         if not line.strip(): continue
-                        
-                        # Parse总是执行，以保持 snapshot 状态更新 (Tick Volume计算正确)
                         symbol, row, error_msg = self.parse_line(line)
                         
                         if symbol and row and should_record:
                             paths = path_map.get(symbol)
                             if paths:
-                                # 写入 CSV
                                 async with aiofiles.open(paths['csv'], "a", newline="", encoding="utf-8") as f:
                                     await f.write(",".join(map(str, row)) + "\n")
-                                
-                                # 写入 Error Log (仅在记录时段内记录错误)
                                 if error_msg:
                                     async with aiofiles.open(paths['err'], "a", encoding="utf-8") as f_err:
                                         await f_err.write(error_msg)
-
                 except Exception:
+                    ERROR_COUNTERS["network"] += 1
                     pass
                 
                 elapsed = time.time() - start_ts
@@ -436,7 +469,8 @@ async def baidu_update_cache(msg: str, key: str):
             GLOBAL_INDEX_CACHE[key] = {
                 "price": price,
                 "server_time": bd_server_time,
-                "local_time": bd_local_time
+                "local_time": bd_local_time,
+                "recv_time": time.time() # [新增]
             }
     except Exception:
         pass
@@ -515,7 +549,8 @@ class SinaDataWorker:
                     GLOBAL_FUTURES_CACHE[code] = {
                         "local_time": current_local_time, "tick_time": tick_time,
                         "price": price, "mid": round(mid, 2), "imb": round(imb, 2),
-                        "delta_vol": int(delta_vol), "pct": round(pct, 2)
+                        "delta_vol": int(delta_vol), "pct": round(pct, 2),
+                        "recv_time": time.time() # [新增]
                     }
                 elif "HKDCNY" in lhs:
                     if len(f) > 3:
@@ -523,6 +558,7 @@ class SinaDataWorker:
                         if last_price > 0:
                             GLOBAL_FX_CACHE["price"] = last_price
                             GLOBAL_FX_CACHE["time"] = f[0]
+                            GLOBAL_FX_CACHE["recv_time"] = time.time()
             except Exception:
                 pass
 
@@ -546,14 +582,10 @@ class SinaDataWorker:
 # ==============================================================================
 
 async def wait_for_data_ready(timeout=60):
-    """
-    等待全局缓存（Index, Futures, FX）初始化完成。
-    """
     print(f"等待数据源初始化 (超时设置: {timeout}秒)...")
     start_time = time.time()
     
     while time.time() - start_time < timeout:
-        # 1. 检查指数数据 (Baidu)
         index_ready = True
         for cfg in BAIDU_CONFIGS:
             key = cfg["key"]
@@ -561,7 +593,6 @@ async def wait_for_data_ready(timeout=60):
                 index_ready = False
                 break
         
-        # 2. 检查期货数据 (Sina)
         futures_ready = False
         for key, val in GLOBAL_FUTURES_CACHE.items():
             if val.get("price", 0) > 0:
@@ -569,15 +600,12 @@ async def wait_for_data_ready(timeout=60):
                 break
         if not GLOBAL_FUTURES_CACHE: futures_ready = False
 
-        # 3. 检查汇率
         fx_ready = GLOBAL_FX_CACHE.get("price", 0) > 0
 
-        # 如果全部就绪，返回 True
         if index_ready and futures_ready and fx_ready:
             print(f"数据源已就绪! (耗时 {time.time() - start_time:.2f}秒)")
             return True
         
-        # 打印当前状态
         print(f"数据预热中... [Index:{index_ready}] [Fut:{futures_ready}] [FX:{fx_ready}]")
         await asyncio.sleep(1)
 
@@ -590,29 +618,24 @@ async def main():
 
     print("启动后台数据采集模块 (Sina/Sentiment/Baidu)...")
     
-    # 1. 启动辅助 Worker (Sina, Sentiment)
     sina_worker = SinaDataWorker()
     task_sina = asyncio.create_task(sina_worker.run())
 
     sentiment_worker = SentimentWorker()
     task_sentiment = asyncio.create_task(sentiment_worker.run())
 
-    # 2. 启动浏览器和百度 Index Worker
     async with async_playwright() as p:
-        # 提示：如果想看到浏览器弹窗，把 headless=True 改为 False
         browser = await p.chromium.launch(headless=False) 
         baidu_tasks = []
         for cfg in BAIDU_CONFIGS:
             baidu_tasks.append(asyncio.create_task(run_baidu_page(cfg, browser)))
         
-        # 3. 【关键修改】阻塞等待，直到缓存中有数据
         await wait_for_data_ready(timeout=60)
 
         print("启动主记录模块 (TencentETFWorker)...")
         tencent_worker = TencentETFWorker()
         task_tencent = asyncio.create_task(tencent_worker.run())
         
-        # 4. 汇总所有任务
         all_tasks = [task_tencent, task_sina, task_sentiment] + baidu_tasks
         try:
             print("系统全速运行中... (按 Ctrl+C 停止)")
