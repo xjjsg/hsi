@@ -36,7 +36,7 @@ CONFIG = {
 
     # --- 打标与成本 ---
     "TRADE_COST": 0.0001,          # 单边费率(可调)
-    "COST_THRESHOLD": 0.0012,      # 净收益阈值（已考虑点差与成本后仍要达标）
+    "COST_THRESHOLD": 0.0004,      # 净收益阈值（已考虑点差与成本后仍要达标）
 
     # --- 外部数据门控（毫秒） ---
     "IDX_DELAY_CUTOFF_MS": 3000,
@@ -67,7 +67,7 @@ CONFIG = {
     "LR": 1e-4,
     "WEIGHT_DECAY": 1e-4,
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
-    "PATIENCE": 20,
+    "PATIENCE": 200,
     "WARMUP_EPOCHS": 10,
 }
 
