@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import warnings
 import math
@@ -135,9 +136,10 @@ class AlphaForge:
         a_files = glob.glob(a_pattern, recursive=True)
 
         def get_date(p: str) -> str:
-            base = os.path.basename(p)
-            # 支持 xxx-YYYY-MM-DD.csv
-            return base.split("-")[-1].split(".")[0]
+            match = re.search(r"(\d{4}-\d{2}-\d{2})", p)
+            if match:
+                return match.group(1)
+            return ""
 
         m_map = {get_date(p): p for p in m_files}
         a_map = {get_date(p): p for p in a_files}
@@ -507,7 +509,7 @@ class HybridDeepLOB(nn.Module):
         )
 
         # Fusion + LSTM + Attention
-        self.lstm = nn.LSTM(input_size=48*3 + 32, hidden_size=64, num_layers=1,
+        self.lstm = nn.LSTM(input_size=48 + 32, hidden_size=64, num_layers=1,
                             batch_first=True, bidirectional=True)
         self.attention = TemporalAttention(hidden_dim=128)
         self.fc = nn.Linear(128, num_classes)
