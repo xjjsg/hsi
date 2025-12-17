@@ -1,574 +1,828 @@
 import os
 import glob
 import warnings
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. 全局配置 (Configuration)
+# 1) 全局配置
 # ==========================================
 CONFIG = {
     # --- 路径配置 ---
-    'DATA_DIR': './data',          
-    'MAIN_SYMBOL': 'sz159920',     
-    'AUX_SYMBOL': 'sh513130',      
-    
-    # --- 因子与数据 ---
-    'RESAMPLE_FREQ': '3S',         # 3秒重采样
-    'PREDICT_HORIZON': 60,         # 预测窗口 180秒
-    'LOOKBACK': 60,                # 回看窗口 180秒
-    
-    # [参数调整] 训练打标门槛 0.0015
-    'COST_THRESHOLD': 0.0012,   
-    
-    # --- 资金管理回测 ---
-    'TRADE_COST': 0.0001,          # 单边万1成本
-    'INITIAL_CAPITAL': 200000,      # 初始本金 20万
-    'CONF_THRESHOLD': 0.55,        # 75% 把握即开仓
-    'MAX_POSITION': 0.9,           # 最大仓位 90%
-    
+    "DATA_DIR": "./data",
+    "MAIN_SYMBOL": "sz159920",
+    "AUX_SYMBOL": "sh513130",
+
+    # --- 采样/标签 ---
+    "RESAMPLE_FREQ": "3S",         # 3秒重采样
+    "PREDICT_HORIZON": 60,         # 未来窗口(条) -> 60*3s=180s
+    "LOOKBACK": 60,                # 输入回看窗口(条)
+
+    # --- 打标与成本 ---
+    "TRADE_COST": 0.0001,          # 单边费率(可调)
+    "COST_THRESHOLD": 0.0012,      # 净收益阈值（已考虑点差与成本后仍要达标）
+
+    # --- 外部数据门控（毫秒） ---
+    "IDX_DELAY_CUTOFF_MS": 3000,
+    "FUT_DELAY_CUTOFF_MS": 3000,
+
+    # --- 回测/执行 ---
+    "INITIAL_CAP": 200000,
+    "CONF_OPEN": 0.60,             # 迟滞：开仓阈值
+    "CONF_CLOSE": 0.45,            # 迟滞：平仓阈值（SigLost）
+    "MAX_POSITION": 0.90,
+    "STOP_LOSS_PCT": 0.008,
+    "MIN_HOLD_BARS": 10,           # 最短持仓(条) -> 10*3s=30s
+    "EXEC_DELAY_BARS": 1,          # 信号 -> 成交 延迟(条)
+    "LIQ_PARTICIPATION": 0.10,     # 单次吃掉卖一/买一深度的比例上限
+    "MIN_TRADE_AMT": 1000,
+    "LOT_SIZE": 100,
+
+    # --- 切分（按天） ---
+    "VAL_DAYS": 1,
+    "TEST_DAYS": 1,
+
+    # --- 时区（用于 tx_local_time 转换到交易所本地时间） ---
+    "TIMEZONE": "Asia/Shanghai",
+
     # --- 训练参数 ---
-    'BATCH_SIZE': 512,             
-    'EPOCHS': 100,
-    'LR': 1e-4,
-    'WEIGHT_DECAY': 1e-4,          # 强正则化
-    'DEVICE': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'PATIENCE': 20,                # 早停耐心
-    'WARMUP_EPOCHS': 10,           # 热身轮数
+    "BATCH_SIZE": 512,
+    "EPOCHS": 100,
+    "LR": 1e-4,
+    "WEIGHT_DECAY": 1e-4,
+    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
+    "PATIENCE": 20,
+    "WARMUP_EPOCHS": 10,
 }
 
 # ==========================================
-# 2. 数据工厂：Alpha Forge (含新增因子)
+# 2) 数据工厂：AlphaForge
 # ==========================================
 class AlphaForge:
-    def __init__(self, cfg):
+    """
+    目标：
+    - 保留原 HybridDeepLOB 模型架构
+    - 重点修复：时间轴、数据对齐、门控、标签与回测一致性
+    - 增加适配 3~5min 频率的“状态/结构”因子（纯后视滚动，不引入未来）
+    """
+    def __init__(self, cfg: Dict):
         self.cfg = cfg
-        self.weights = np.array([1.0, 0.8, 0.6, 0.4, 0.2])
+        self.weights = np.array([1.0, 0.8, 0.6, 0.4, 0.2], dtype=np.float32)
 
     def load_and_split(self):
-        print(f"🚀 [AlphaForge] 启动... 扫描: {self.cfg['DATA_DIR']}")
+        print(f"🚀 [AlphaForge] 扫描: {self.cfg['DATA_DIR']}")
         pairs = self._match_files()
         pairs.sort(key=lambda x: x[0])
-        
-        if len(pairs) < 2: raise ValueError("数据不足2天")
-        
-        train_pairs = pairs[:-1]
-        test_pair = pairs[-1]
-        
-        print(f"训练集: {train_pairs[0][0]} ~ {train_pairs[-1][0]}")
-        print(f"测试集: {test_pair[0]}")
-        
-        train_df = self._process_batch(train_pairs)
-        test_df = self._process_batch([test_pair])
-        
-        return train_df, test_df
+        if len(pairs) < (1 + self.cfg["VAL_DAYS"] + self.cfg["TEST_DAYS"]):
+            raise ValueError("数据天数不足以切分 train/val/test")
 
-    def _process_batch(self, pairs):
+        n_val = self.cfg["VAL_DAYS"]
+        n_test = self.cfg["TEST_DAYS"]
+        train_pairs = pairs[: -(n_val + n_test)]
+        val_pairs = pairs[-(n_val + n_test): -n_test]
+        test_pairs = pairs[-n_test:]
+
+        print(f"训练集: {train_pairs[0][0]} ~ {train_pairs[-1][0]}")
+        print(f"验证集: {val_pairs[0][0]} ~ {val_pairs[-1][0]}")
+        print(f"测试集: {test_pairs[0][0]} ~ {test_pairs[-1][0]}")
+
+        train_df = self._process_batch(train_pairs)
+        val_df = self._process_batch(val_pairs)
+        test_df = self._process_batch(test_pairs)
+        return train_df, val_df, test_df
+
+    def _process_batch(self, pairs: List[Tuple[str, str, str]]) -> pd.DataFrame:
         dfs = []
         for date, mf, af in pairs:
             try:
                 df = self._load_pair(mf, af, date)
-                if df is None or len(df) < 200: continue
+                if df is None or len(df) < 300:
+                    continue
+
                 df = self._calc_factors(df)
                 df = self._make_labels(df)
-                df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+                # 只对“绝对必要列”做 dropna，避免外部列缺失导致选择偏差
+                required = ["mid", "bp1", "sp1", "label"]
+                df = df.replace([np.inf, -np.inf], np.nan)
+                df = df.dropna(subset=[c for c in required if c in df.columns])
+
                 dfs.append(df)
             except Exception as e:
                 print(f"⚠️ 跳过 {date}: {e}")
+
         return pd.concat(dfs).sort_index() if dfs else pd.DataFrame()
 
     def _match_files(self):
-        m_pattern = os.path.join(self.cfg['DATA_DIR'], "**", f"{self.cfg['MAIN_SYMBOL']}*.csv")
-        a_pattern = os.path.join(self.cfg['DATA_DIR'], "**", f"{self.cfg['AUX_SYMBOL']}*.csv")
+        m_pattern = os.path.join(self.cfg["DATA_DIR"], "**", f"{self.cfg['MAIN_SYMBOL']}*.csv")
+        a_pattern = os.path.join(self.cfg["DATA_DIR"], "**", f"{self.cfg['AUX_SYMBOL']}*.csv")
         m_files = glob.glob(m_pattern, recursive=True)
         a_files = glob.glob(a_pattern, recursive=True)
-        
-        def get_date(p):
-            try:
-                base = os.path.basename(p)
-                parts = base.replace('.csv','').split('-')
-                if len(parts) >= 3: return f"{parts[-3]}-{parts[-2]}-{parts[-1]}"
-            except: pass
-            return None
 
-        m_map = {get_date(f): f for f in m_files if get_date(f)}
-        a_map = {get_date(f): f for f in a_files if get_date(f)}
+        def get_date(p: str) -> str:
+            base = os.path.basename(p)
+            # 支持 xxx-YYYY-MM-DD.csv
+            return base.split("-")[-1].split(".")[0]
+
+        m_map = {get_date(p): p for p in m_files}
+        a_map = {get_date(p): p for p in a_files}
         common = sorted(list(set(m_map.keys()) & set(a_map.keys())))
         return [(d, m_map[d], a_map[d]) for d in common]
 
-    def _load_pair(self, m_path, a_path, date_str):
-        def _read(p):
+    # -----------------------------
+    # 读取 & 对齐
+    # -----------------------------
+    def _load_pair(self, m_path: str, a_path: str, date_str: str) -> Optional[pd.DataFrame]:
+        def _read(p: str) -> pd.DataFrame:
             d = pd.read_csv(p)
-            d['datetime'] = pd.to_datetime(date_str + ' ' + d['tx_server_time'])
-            return d.set_index('datetime').sort_index().groupby(level=0).last()
-        
+
+            # 1) 用 tx_local_time 作为唯一主时间轴（如果不存在则回退到 tx_server_time）
+            if "tx_local_time" in d.columns and d["tx_local_time"].notna().any():
+                dt_utc = pd.to_datetime(d["tx_local_time"], unit="ms", utc=True, errors="coerce")
+                tz = self.cfg.get("TIMEZONE", "Asia/Shanghai")
+                d["datetime"] = dt_utc.dt.tz_convert(tz).dt.tz_localize(None)
+            else:
+                d["datetime"] = pd.to_datetime(date_str + " " + d["tx_server_time"], errors="coerce")
+
+            # 2) 强制数值类型（空串/脏字符 -> NaN）
+            numeric_like = set([
+                "price","iopv","premium_rate","index_price","fx_rate","sentiment",
+                "tick_vol","tick_amt","tick_vwap","interval_s",
+                "idx_delay_ms","fut_delay_ms","data_flags",
+                "fut_price","fut_mid","fut_imb","fut_delta_vol","fut_pct",
+                "fut_local_time","fut_tick_time",
+            ])
+            # LOB
+            for s in ["bp","bv","sp","sv"]:
+                for i in range(1,6):
+                    numeric_like.add(f"{s}{i}")
+
+            cols = [c for c in d.columns if c in numeric_like]
+            if cols:
+                d[cols] = d[cols].apply(pd.to_numeric, errors="coerce")
+
+            d = d.sort_values("datetime")
+            d = d.drop_duplicates(subset="datetime", keep="last")
+            d = d.set_index("datetime").sort_index()
+            return d
+
         df_m, df_a = _read(m_path), _read(a_path)
-        
+
+        # --- 主标的聚合：必须包含 tick_amt，重算 bin_vwap ---
         agg = {
-            'price': 'last', 'tick_vol': 'sum',
-            'bp1': 'last', 'sp1': 'last', 'bp2': 'last', 'sp2': 'last', 
-            'bp3': 'last', 'sp3': 'last', 'bp4': 'last', 'sp4': 'last', 
-            'bp5': 'last', 'sp5': 'last', 'bv1': 'last', 'sv1': 'last',
-            'bv2': 'last', 'sv2': 'last', 'bv3': 'last', 'sv3': 'last',
-            'bv4': 'last', 'sv4': 'last', 'bv5': 'last', 'sv5': 'last',
+            "price": "last",
+            "tick_vol": "sum",
+            "tick_amt": "sum",
+            "bp1": "last", "sp1": "last", "bp2": "last", "sp2": "last",
+            "bp3": "last", "sp3": "last", "bp4": "last", "sp4": "last",
+            "bp5": "last", "sp5": "last",
+            "bv1": "last", "sv1": "last", "bv2": "last", "sv2": "last",
+            "bv3": "last", "sv3": "last", "bv4": "last", "sv4": "last",
+            "bv5": "last", "sv5": "last",
+            # 外部列（存在则加进去）
+            "index_price": "last",
+            "premium_rate": "last",
+            "sentiment": "last",
+            "fx_rate": "last",
+            "tick_vwap": "last",
+            "interval_s": "last",
+            "idx_delay_ms": "max",
+            "fut_delay_ms": "max",
+            "data_flags": "max",
+            "fut_price": "last",
+            "fut_mid": "last",
+            "fut_imb": "last",
+            "fut_delta_vol": "last",
+            "fut_pct": "last",
         }
-        
-        # [新增] 确保核心 Alpha 因子源数据被读入
-        extra_cols = ['index_price', 'fut_price', 'fut_imb', 'premium_rate', 'sentiment', 'tick_vwap']
-        for c in extra_cols:
-            if c in df_m.columns: 
-                agg[c] = 'last'
-            
-        df_m = df_m.resample(self.cfg['RESAMPLE_FREQ']).agg(agg)
-        df_a = df_a.resample(self.cfg['RESAMPLE_FREQ']).agg({'price': 'last', 'tick_vol': 'sum'})
-        df_a.columns = ['peer_price', 'peer_vol']
-        return df_m.join(df_a, how='inner')
+        # 只保留 df_m 里真正存在的列
+        agg = {k:v for k,v in agg.items() if k in df_m.columns}
 
-    def _calc_factors(self, df):
-        # 1. Meta Factors
-        sec = df.index.hour * 3600 + df.index.minute * 60 + df.index.second
-        df['meta_time'] = np.clip(np.where(sec <= 41400, (sec-34200)/14400, 0.5+(sec-46800)/14400), 0, 1)
-        
-        # 2. Micro Factors
-        mid = (df['bp1'] + df['sp1']) / 2
-        df['mid'] = mid
-        safe_mid = mid.replace(0, np.nan).fillna(method='ffill')
-        
-        wb = sum(df[f'bv{i}']*self.weights[i-1] for i in range(1,6))
-        wa = sum(df[f'sv{i}']*self.weights[i-1] for i in range(1,6))
-        df['feat_micro_pressure'] = (wb - wa) / (wb + wa + 1e-8)
-        
-        # [新增] 四大核心 Alpha 因子
-        # A. 折溢价率
-        if 'premium_rate' in df.columns:
-            df['feat_premium_rate'] = df['premium_rate']
-        elif 'index_price' in df.columns:
-            df['feat_premium_rate'] = (df['index_price'] - safe_mid) / safe_mid
+        df_m = df_m.resample(self.cfg["RESAMPLE_FREQ"]).agg(agg)
 
-        # B. 情绪因子
-        if 'sentiment' in df.columns:
-            df['feat_sentiment'] = df['sentiment']
-            
-        # C. 期货盘口失衡
-        if 'fut_imb' in df.columns:
-            df['feat_fut_imb'] = df['fut_imb']
-            
-        # D. 资金流向力度 (Flow Force)
-        if 'tick_vwap' in df.columns and 'tick_vol' in df.columns:
-            df['feat_flow_force'] = (df['tick_vwap'] - df['mid']) * np.log1p(df['tick_vol'])
-            
-        # 3. Oracle Factors
-        if 'index_price' in df.columns:
-            df['feat_oracle_basis'] = (df['index_price'] - safe_mid) / safe_mid
-            df['feat_oracle_idx_mom'] = df['index_price'].pct_change(2)
-        if 'fut_price' in df.columns:
-            df['feat_oracle_fut_lead'] = df['fut_price'].pct_change()
-            
-        # 4. Peer Factors
-        df['feat_peer_diff'] = df['price'].pct_change() - df['peer_price'].pct_change()
+        # tick_vol/tick_amt 防御性修正
+        if "tick_vol" in df_m.columns:
+            df_m["tick_vol"] = df_m["tick_vol"].clip(lower=0)
+        if "tick_amt" in df_m.columns:
+            df_m["tick_amt"] = df_m["tick_amt"].clip(lower=0)
+
+        # 重算 bin_vwap（更符合 3S 聚合统计意义）
+        if "tick_vol" in df_m.columns and "tick_amt" in df_m.columns:
+            denom = df_m["tick_vol"].replace(0, np.nan)
+            df_m["tick_vwap_bin"] = (df_m["tick_amt"] / denom).fillna(df_m.get("price"))
+        else:
+            df_m["tick_vwap_bin"] = df_m.get("tick_vwap", df_m.get("price"))
+
+        # --- 辅标的聚合：更宽容（left + ffill） ---
+        agg_a = {"price": "last", "tick_vol": "sum"}
+        agg_a = {k:v for k,v in agg_a.items() if k in df_a.columns}
+        df_a = df_a.resample(self.cfg["RESAMPLE_FREQ"]).agg(agg_a)
+        df_a = df_a.rename(columns={"price":"peer_price", "tick_vol":"peer_vol"})
+
+        df = df_m.join(df_a, how="left")
+        # 只用过去值填充，避免未来
+        if "peer_price" in df.columns:
+            df["peer_price"] = df["peer_price"].ffill()
+        if "peer_vol" in df.columns:
+            df["peer_vol"] = df["peer_vol"].fillna(0)
+
+        df = df.dropna(subset=["price", "bp1", "sp1"])
         return df
 
-    def _make_labels(self, df):
-        mid = df['mid']
-        horizon = self.cfg['PREDICT_HORIZON']
-        threshold = self.cfg['COST_THRESHOLD']
-        
+    # -----------------------------
+    # 因子
+    # -----------------------------
+    def _calc_factors(self, df: pd.DataFrame) -> pd.DataFrame:
+        # ---------- 基础 ----------
+        df["mid"] = (df["bp1"] + df["sp1"]) / 2.0
+        df["spread"] = (df["sp1"] - df["bp1"]).clip(lower=0)
+
+        # Meta time: 映射到 [0,1]
+        # 简化：按 09:30-15:00(含午休) 线性映射，作为“日内位置”特征
+        t = df.index
+        seconds = t.hour*3600 + t.minute*60 + t.second
+        start = 9*3600 + 30*60
+        end = 15*3600
+        df["meta_time"] = np.clip((seconds - start) / (end - start), 0, 1)
+
+        # ---------- 微观结构：原 micro_pressure ----------
+        wb = (df[[f"bv{i}" for i in range(1,6)]].values * self.weights).sum(axis=1)
+        wa = (df[[f"sv{i}" for i in range(1,6)]].values * self.weights).sum(axis=1)
+        denom = (wb + wa)
+        df["feat_micro_pressure"] = np.where(denom == 0, 0.0, (wb - wa) / denom)
+
+        # ---------- 新增：3~5min 频率更稳的因子 ----------
+        # 1) 点差成本占比
+        df["feat_spread_pct"] = (df["spread"] / df["mid"]).replace([np.inf, -np.inf], np.nan)
+
+        # 2) 一档深度与深度不平衡
+        depth1 = (df["bv1"] + df["sv1"]).replace(0, np.nan)
+        df["feat_depth1_log"] = np.log1p((df["bv1"] + df["sv1"]).clip(lower=0))
+        df["feat_depth_imb1"] = ((df["bv1"] - df["sv1"]) / depth1).fillna(0.0)
+
+        # 3) TFI：成交流失衡（用 tick_vwap_bin 相对 mid 判断主动方向）
+        tv = df["tick_vwap_bin"].fillna(df["mid"])
+        vol = df.get("tick_vol", pd.Series(0, index=df.index)).fillna(0).clip(lower=0)
+        df["feat_tfi"] = np.sign(tv - df["mid"]).fillna(0.0) * np.log1p(vol)
+
+        # 4) OFI（简化 Cont-OFI，适配 3s 快照）
+        bp1, bv1 = df["bp1"], df["bv1"]
+        sp1, sv1 = df["sp1"], df["sv1"]
+        bp1_prev, bv1_prev = bp1.shift(1), bv1.shift(1)
+        sp1_prev, sv1_prev = sp1.shift(1), sv1.shift(1)
+
+        ofi_bid = np.where(bp1 > bp1_prev, bv1,
+                    np.where(bp1 == bp1_prev, bv1 - bv1_prev, -bv1_prev))
+        ofi_ask = np.where(sp1 < sp1_prev, sv1,
+                    np.where(sp1 == sp1_prev, sv1 - sv1_prev, -sv1_prev))
+        ofi_raw = np.nan_to_num(ofi_bid) - np.nan_to_num(ofi_ask)
+        df["feat_ofi1"] = np.sign(ofi_raw) * np.log1p(np.abs(ofi_raw))
+
+        # 5) LOB skew：价差形态偏度
+        bid_span = (df["bp1"] - df["bp5"]).clip(lower=0)
+        ask_span = (df["sp5"] - df["sp1"]).clip(lower=0)
+        denom2 = (bid_span + ask_span).replace(0, np.nan)
+        df["feat_lob_skew"] = ((bid_span - ask_span) / denom2).fillna(0.0)
+
+        # 6) Book slope：远端挂单“陡峭程度”
+        df["feat_ask_slope"] = ((df["sp5"] - df["sp1"]) / df["mid"]).replace([np.inf, -np.inf], np.nan)
+        df["feat_bid_slope"] = ((df["bp1"] - df["bp5"]) / df["mid"]).replace([np.inf, -np.inf], np.nan)
+
+        # ---------- 原核心 Alpha 因子源列 ----------
+        # premium: 优先用采集 premium_rate，否则用 index-mid 近似
+        if "premium_rate" in df.columns and df["premium_rate"].notna().any():
+            df["feat_premium_rate"] = df["premium_rate"]
+        else:
+            idx = df.get("index_price")
+            if idx is not None:
+                df["feat_premium_rate"] = (idx - df["mid"]) / df["mid"]
+            else:
+                df["feat_premium_rate"] = 0.0
+
+        if "sentiment" in df.columns:
+            df["feat_sentiment"] = df["sentiment"]
+        else:
+            df["feat_sentiment"] = 0.0
+
+        if "fut_imb" in df.columns:
+            df["feat_fut_imb"] = df["fut_imb"]
+        else:
+            df["feat_fut_imb"] = 0.0
+
+        # Flow force（用 bin_vwap + vol）
+        df["feat_flow_force"] = (tv - df["mid"]) * np.log1p(vol)
+
+        # ---------- 3~5min 状态因子：纯后视 rolling ----------
+        # window sizes based on RESAMPLE_FREQ
+        # 5min: 300s
+        freq = pd.to_timedelta(self.cfg["RESAMPLE_FREQ"])
+        w5 = int(pd.Timedelta("5min") / freq)
+        w3 = int(pd.Timedelta("3min") / freq)
+        w15 = int(pd.Timedelta("15min") / freq)
+
+        mid = df["mid"]
+        logret = np.log(mid).diff()
+
+        # 5min 方向/动量
+        df["feat_ret_5m"] = mid.pct_change(w5)
+        # 5min RV
+        df["feat_rv_5m"] = np.sqrt((logret**2).rolling(w5).sum())
+        # 5min 价格效率比
+        hi5 = mid.rolling(w5).max()
+        lo5 = mid.rolling(w5).min()
+        denom3 = (hi5 - lo5).replace(0, np.nan)
+        df["feat_eff_5m"] = (mid - mid.shift(w5)).abs() / denom3
+
+        # 5min 平均点差/深度/流动性状态
+        df["feat_spread_mean_5m"] = df["spread"].rolling(w5).mean()
+        df["feat_depth1_mean_5m"] = (df["bv1"] + df["sv1"]).rolling(w5).mean()
+
+        # 5min 订单流聚合
+        df["feat_ofi_5m"] = df["feat_ofi1"].rolling(w5).sum()
+        df["feat_tfi_5m"] = df["feat_tfi"].rolling(w5).sum()
+
+        # 量能 z-score（用更长窗口做均值方差）
+        bar_vol_5m = vol.rolling(w5).sum()
+        mu = bar_vol_5m.rolling(w15).mean()
+        sd = bar_vol_5m.rolling(w15).std().replace(0, np.nan)
+        df["feat_volz_5m"] = ((bar_vol_5m - mu) / sd).fillna(0.0)
+
+        # ---------- Peer 残差动量（滚动 beta） ----------
+        if "peer_price" in df.columns and df["peer_price"].notna().any():
+            peer_mid = df["peer_price"]
+            r = mid.pct_change()
+            rp = peer_mid.pct_change()
+            # beta: cov(r, rp)/var(rp)
+            cov = (r * rp).rolling(w15).mean() - r.rolling(w15).mean() * rp.rolling(w15).mean()
+            var = (rp**2).rolling(w15).mean() - (rp.rolling(w15).mean()**2)
+            beta = (cov / var.replace(0, np.nan)).fillna(1.0)
+            df["feat_peer_resid"] = (r - beta * rp).fillna(0.0)
+        else:
+            df["feat_peer_resid"] = 0.0
+
+        # ---------- Oracle（外部因子） + 门控 ----------
+        # 指数动量、期货领先等：只有在 delay 不坏时才“开放”
+        # 兼容旧数据：没有 delay 字段时默认可用
+        idx_delay = df.get("idx_delay_ms", pd.Series(np.nan, index=df.index))
+        fut_delay = df.get("fut_delay_ms", pd.Series(np.nan, index=df.index))
+        flags = df.get("data_flags", pd.Series(0, index=df.index)).fillna(0)
+
+        df["feat_idx_staleness"] = np.log1p(idx_delay.fillna(999999))
+        df["feat_fut_staleness"] = np.log1p(fut_delay.fillna(999999))
+
+        bad_idx = (idx_delay > self.cfg["IDX_DELAY_CUTOFF_MS"]) | (flags > 0)
+        bad_fut = (fut_delay > self.cfg["FUT_DELAY_CUTOFF_MS"]) | (flags > 0)
+
+        if "index_price" in df.columns:
+            df["feat_oracle_idx_mom"] = df["index_price"].pct_change(2)
+            df["feat_oracle_basis"] = (df["index_price"] - df["mid"]) / df["mid"]
+            df.loc[bad_idx.fillna(False), ["feat_oracle_idx_mom", "feat_oracle_basis"]] = np.nan
+        else:
+            df["feat_oracle_idx_mom"] = 0.0
+            df["feat_oracle_basis"] = 0.0
+
+        if "fut_price" in df.columns:
+            # 期货“领先”简化：期货短动量 - 现货短动量
+            fut_mom = df["fut_price"].pct_change(2)
+            spot_mom = df["mid"].pct_change(2)
+            df["feat_oracle_fut_lead"] = (fut_mom - spot_mom)
+            df.loc[bad_fut.fillna(False), ["feat_oracle_fut_lead"]] = np.nan
+        else:
+            df["feat_oracle_fut_lead"] = 0.0
+
+        # 清理极端值
+        for c in [c for c in df.columns if c.startswith("feat_")]:
+            df[c] = df[c].replace([np.inf, -np.inf], np.nan)
+
+        return df
+
+    # -----------------------------
+    # 标签：与回测成交口径一致（Ask 买 / Bid 卖）
+    # -----------------------------
+    def _make_labels(self, df: pd.DataFrame) -> pd.DataFrame:
+        horizon = int(self.cfg["PREDICT_HORIZON"])
+        thr = float(self.cfg["COST_THRESHOLD"])
+        cost = float(self.cfg["TRADE_COST"])
+
+        ask = df["sp1"]
+        bid = df["bp1"]
+
         indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=horizon)
-        future_max = mid.rolling(window=indexer).max()
-        future_min = mid.rolling(window=indexer).min()
-        
-        max_ret = future_max / mid - 1
-        min_ret = future_min / mid - 1
-        
-        labels = np.zeros(len(df))
-        mask_buy = max_ret > threshold
-        mask_sell = min_ret < -threshold
-        
-        labels[mask_buy] = 1
-        labels[mask_sell] = 2
-        
-        conflict = mask_buy & mask_sell
-        if conflict.any():
-            c_max = max_ret[conflict]
-            c_min = min_ret[conflict].abs()
-            labels[conflict] = np.where(c_max > c_min, 1, 2)
-            
-        df['label'] = labels
-        # 保留真实未来收益 (旧版回测用，新版用全量数据模拟)
-        df['real_future_ret'] = mid.shift(-horizon) / mid - 1
+
+        # 未来最高 Bid：我现在按 Ask 买，未来能否按 Bid 卖出赚钱？
+        future_max_bid = bid.rolling(window=indexer).max()
+        ret_buy = (future_max_bid / ask) - 1.0 - 2.0 * cost
+
+        # 未来最低 Bid：如果未来会出现明显回撤，作为“卖出/避险”标签
+        future_min_bid = bid.rolling(window=indexer).min()
+        ret_drawdown = (future_min_bid / bid) - 1.0
+
+        label = np.zeros(len(df), dtype=np.int64)
+        label[ret_buy > thr] = 1
+        label[ret_drawdown < -thr] = 2
+
+        # 同时给回测/分析保留一个未来点收益（不用于打标决策）
+        future_mid = df["mid"].shift(-horizon)
+        df["real_future_ret"] = (future_mid / df["mid"]) - 1.0
+
+        df["label"] = label
         return df
+
 
 # ==========================================
-# 3. 高级模型组件 (Unchanged)
+# 3) 模型：HybridDeepLOB（保持原架构）
 # ==========================================
 class SEBlock(nn.Module):
-    def __init__(self, channel, reduction=4):
+    def __init__(self, channels, reduction=8):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels),
             nn.Sigmoid()
         )
     def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+        b, c, _ = x.shape
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y
 
 class InceptionBlock(nn.Module):
-    def __init__(self, in_chan, out_chan):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.b1 = nn.Sequential(nn.Conv2d(in_chan, out_chan, 1), nn.LeakyReLU(0.01), nn.BatchNorm2d(out_chan))
-        self.b2 = nn.Sequential(nn.Conv2d(in_chan, out_chan, 1), nn.LeakyReLU(0.01), 
-                                nn.Conv2d(out_chan, out_chan, (3,1), padding=(1,0)), nn.LeakyReLU(0.01), nn.BatchNorm2d(out_chan))
-        self.b3 = nn.Sequential(nn.Conv2d(in_chan, out_chan, 1), nn.LeakyReLU(0.01),
-                                nn.Conv2d(out_chan, out_chan, (5,1), padding=(2,0)), nn.LeakyReLU(0.01), nn.BatchNorm2d(out_chan))
-        self.b4 = nn.Sequential(nn.MaxPool2d((3,1), stride=1, padding=(1,0)),
-                                nn.Conv2d(in_chan, out_chan, 1), nn.LeakyReLU(0.01), nn.BatchNorm2d(out_chan))
-        self.se = SEBlock(out_chan * 4)
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=1, padding=0)
+        self.conv3 = nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.conv5 = nn.Conv1d(in_ch, out_ch, kernel_size=5, padding=2)
+        self.bn = nn.BatchNorm1d(out_ch * 3)
     def forward(self, x):
-        out = torch.cat([self.b1(x), self.b2(x), self.b3(x), self.b4(x)], dim=1)
-        return self.se(out)
+        y1 = F.relu(self.conv1(x))
+        y3 = F.relu(self.conv3(x))
+        y5 = F.relu(self.conv5(x))
+        y = torch.cat([y1, y3, y5], dim=1)
+        return F.relu(self.bn(y))
 
 class TemporalAttention(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_dim):
         super().__init__()
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.value = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.scale = float(hidden_size) ** 0.5
-
-    def forward(self, lstm_output):
-        last_step = lstm_output[:, -1, :].unsqueeze(1)
-        scores = torch.bmm(self.query(last_step), self.key(lstm_output).transpose(1, 2)) / self.scale
-        attn_weights = F.softmax(scores, dim=-1)
-        context = torch.bmm(attn_weights, self.value(lstm_output))
-        return context.squeeze(1)
+        self.W = nn.Linear(hidden_dim, hidden_dim)
+        self.v = nn.Linear(hidden_dim, 1, bias=False)
+    def forward(self, x):
+        # x: (B, T, H)
+        scores = self.v(torch.tanh(self.W(x))).squeeze(-1)
+        weights = torch.softmax(scores, dim=1).unsqueeze(-1)
+        return (x * weights).sum(dim=1)
 
 class HybridDeepLOB(nn.Module):
-    def __init__(self, num_expert):
+    def __init__(self, num_exp_features, num_classes=3):
         super().__init__()
-        c_chan = 32
-        m_hid = 64
-        l_hid = 128
-        
-        self.compress = nn.Sequential(
-            nn.Conv2d(1, c_chan, (1, 2), stride=(1, 2)), nn.LeakyReLU(), nn.BatchNorm2d(c_chan),
-            nn.Conv2d(c_chan, c_chan, (4, 1), padding='same'), nn.LeakyReLU(), nn.BatchNorm2d(c_chan),
-            nn.Conv2d(c_chan, c_chan, (1, 2), stride=(1, 2)), nn.LeakyReLU(), nn.BatchNorm2d(c_chan),
-            nn.Conv2d(c_chan, c_chan, (1, 5), stride=(1, 5)), nn.LeakyReLU(), nn.BatchNorm2d(c_chan),
-        )
-        self.inception1 = InceptionBlock(c_chan, c_chan)
-        self.inception2 = InceptionBlock(128, 64)
-        
+        # CNN branch (DeepLOB-like)
+        self.conv1 = nn.Conv1d(20, 32, kernel_size=3, padding=1)
+        self.se1 = SEBlock(32)
+        self.inception1 = InceptionBlock(32, 16)
+        self.inception2 = InceptionBlock(48, 16)
+
+        # Expert branch
         self.expert = nn.Sequential(
-            nn.Linear(num_expert, m_hid), nn.LeakyReLU(), nn.BatchNorm1d(m_hid), nn.Dropout(0.2)
-        )
-        
-        fusion_dim = 256 + m_hid
-        self.lstm = nn.LSTM(fusion_dim, l_hid, num_layers=2, batch_first=True, dropout=0.5)
-        self.attention = TemporalAttention(l_hid)
-        
-        self.dropout = nn.Dropout(0.5)
-        self.head = nn.Sequential(
-            nn.Linear(l_hid, 64), nn.LeakyReLU(), nn.Linear(64, 3)
+            nn.Linear(num_exp_features, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 32),
+            nn.ReLU()
         )
 
+        # Fusion + LSTM + Attention
+        self.lstm = nn.LSTM(input_size=48*3 + 32, hidden_size=64, num_layers=1,
+                            batch_first=True, bidirectional=True)
+        self.attention = TemporalAttention(hidden_dim=128)
+        self.fc = nn.Linear(128, num_classes)
+
     def forward(self, x_lob, x_exp):
-        x = x_lob.unsqueeze(1)
-        feat = self.compress(x)
+        # x_lob: (B, T, 20) -> (B, 20, T)
+        x = x_lob.permute(0, 2, 1)
+        feat = F.relu(self.conv1(x))
+        feat = self.se1(feat)
         feat = self.inception1(feat)
         feat = self.inception2(feat)
-        feat = feat.squeeze(-1).permute(0, 2, 1)
-        
-        if feat.shape[1] != x_exp.shape[1]:
-            feat = feat.permute(0, 2, 1)
-            feat = nn.functional.adaptive_avg_pool1d(feat, x_exp.shape[1])
-            feat = feat.permute(0, 2, 1)
-            
-        B, T, F = x_exp.shape
-        exp = self.expert(x_exp.reshape(-1, F)).reshape(B, T, -1)
-        
+        feat = feat.permute(0, 2, 1)  # (B, T, C)
+
+        # expert on each timestep
+        B, T, Fexp = x_exp.shape
+        exp = self.expert(x_exp.reshape(-1, Fexp)).reshape(B, T, -1)
+
         combined = torch.cat([feat, exp], dim=2)
         lstm_out, _ = self.lstm(combined)
         context = self.attention(lstm_out)
-        return self.head(self.dropout(context))
+        return self.fc(context)
+
 
 # ==========================================
-# 4. 训练与实盘模拟引擎
+# 4) 数据集（修复：只在 train 上 fit scaler + 统一填充策略）
 # ==========================================
 class ETFDataset(Dataset):
-    def __init__(self, df, lookback, scaler=None):
-        self.lookback = lookback
-        lob_cols = [f'{s}{i}' for i in range(1,6) for s in ['bp','sp']] + [f'{s}{i}' for i in range(1,6) for s in ['bv','sv']]
-        exp_cols = [c for c in df.columns if c.startswith('feat_') or c.startswith('meta_')]
-        
-        mid = df['mid'].values.reshape(-1, 1)
-        safe_mid = np.where(mid==0, 1.0, mid)
-        lob_data = df[lob_cols].values
-        lob_data[:, :10] = (lob_data[:, :10] - mid) / safe_mid * 10000
-        lob_data[:, 10:] = np.log1p(lob_data[:, 10:])
+    def __init__(self, df: pd.DataFrame, lookback: int,
+                 scaler: Optional[StandardScaler]=None,
+                 imputer: Optional[Dict[str, float]]=None):
+        self.lookback = int(lookback)
+
+        lob_cols = [f"{s}{i}" for i in range(1,6) for s in ["bp","sp"]] + \
+                   [f"{s}{i}" for i in range(1,6) for s in ["bv","sv"]]
+        exp_cols = [c for c in df.columns if c.startswith("feat_") or c.startswith("meta_")]
+
+        # --- LOB tensor ---
+        mid = df["mid"].values.reshape(-1, 1)
+        safe_mid = np.where(mid == 0, 1.0, mid)
+        lob_data = df[lob_cols].values.astype(np.float32)
+
+        # price levels -> relative bps
+        lob_data[:, :10] = (lob_data[:, :10] - mid) / safe_mid * 10000.0
+        # sizes -> log1p
+        lob_data[:, 10:] = np.log1p(np.clip(lob_data[:, 10:], a_min=0, a_max=None))
+
         self.X_lob = np.nan_to_num(lob_data).astype(np.float32)
-        
-        exp_data = np.nan_to_num(df[exp_cols].values)
+
+        # --- Expert features ---
+        exp_df = df[exp_cols].copy()
+
+        # 缺失指示（让模型知道“不可用/被门控”）
+        miss_flags = exp_df.isna().astype(np.float32)
+        miss_flags.columns = [c + "_isna" for c in miss_flags.columns]
+
+        # impute：只用 train 统计的中位数
+        if imputer is None:
+            self.imputer = {c: float(exp_df[c].median(skipna=True)) if exp_df[c].notna().any() else 0.0 for c in exp_cols}
+        else:
+            self.imputer = imputer
+
+        for c in exp_cols:
+            exp_df[c] = exp_df[c].fillna(self.imputer.get(c, 0.0))
+
+        exp_full = pd.concat([exp_df, miss_flags], axis=1)
+        self.exp_feature_names = exp_full.columns.tolist()
+        exp_data = exp_full.values.astype(np.float32)
+
         if scaler is None:
             self.scaler = StandardScaler()
             self.X_exp = self.scaler.fit_transform(exp_data).astype(np.float32)
         else:
             self.scaler = scaler
             self.X_exp = self.scaler.transform(exp_data).astype(np.float32)
-            
-        self.Y = df['label'].values.astype(np.int64)
-        self.raw_ret = df['real_future_ret'].values
-        
-    def __len__(self): return len(self.Y) - self.lookback
+
+        self.Y = df["label"].values.astype(np.int64)
+        self.raw_ret = df.get("real_future_ret", pd.Series(np.nan, index=df.index)).values.astype(np.float32)
+
+    def __len__(self):
+        # 让最后一个标签也可用
+        return max(0, len(self.Y) - self.lookback + 1)
+
     def __getitem__(self, i):
-        s, e = i, i + self.lookback
-        return self.X_lob[s:e], self.X_exp[s:e], self.Y[e-1], self.raw_ret[e-1]
-
-def backtest_evaluate(model, dataloader, cfg, raw_df=None):
-    """
-    [升级版] 真实实盘逻辑回测引擎
-    特性：
-    1. 交易日志输出到文件 (backtest_log.txt)，解决终端刷屏问题
-    2. 对手价成交 (Ask买/Bid卖)
-    3. 每日收盘前(14:55)强制清仓
-    """
-    model.eval()
-    
-    # --- 阶段一：全量推理 ---
-    all_probs = []
-    with torch.no_grad():
-        for x_lob, x_exp, _, _ in dataloader:
-            x_lob = x_lob.to(cfg['DEVICE'])
-            x_exp = x_exp.to(cfg['DEVICE'])
-            logits = model(x_lob, x_exp)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
-            all_probs.append(probs)
-    
-    if not all_probs: return 0.0
-    probs_stream = np.concatenate(all_probs, axis=0)
-    
-    valid_len = len(probs_stream)
-    if raw_df is None: return 0.0
-        
-    # 对齐数据
-    sim_df = raw_df.iloc[-valid_len:].copy()
-    
-    # 提取关键列 (对手价)
-    ask_prices = sim_df['sp1'].values # 卖一价 (买入用)
-    bid_prices = sim_df['bp1'].values # 买一价 (卖出用)
-    last_prices = sim_df['price'].values
-    
-    # 时间处理
-    if 'datetime' in sim_df.columns:
-        raw_times = pd.to_datetime(sim_df['datetime'].values)
-    else:
-        raw_times = pd.to_datetime(sim_df.index.values)
-        
-    # 计算每日收盘强制平仓标志 (14:55 之后)
-    eod_flags = (raw_times.hour == 14) & (raw_times.minute >= 55)
-    
-    times_str = raw_times.strftime('%Y-%m-%d %H:%M:%S').values
-    
-    cash = float(cfg['INITIAL_CAPITAL'])
-    shares = 0.0
-    initial_cap = cash
-    cost_rate = cfg['TRADE_COST']
-    conf_thresh = cfg['CONF_THRESHOLD']
-    max_pos = cfg['MAX_POSITION']
-    
-    trades = 0; wins = 0
-    entry_price = 0.0
-    is_holding = False
-    
-    # [修改] 准备日志文件
-    log_file = "backtest_log.txt"
-    
-    # 使用 'w' 模式每次覆盖，如果想追加可用 'a'
-    with open(log_file, "w", encoding="utf-8") as f:
-        f.write(f"=== 回测交易日志 (Start: {times_str[0]}) ===\n")
-        f.write(f"参数: Threshold={conf_thresh}, Cost={cost_rate}, EOD_Clear=14:55\n")
-        f.write("-" * 60 + "\n")
-        
-        for t in range(valid_len):
-            curr_ask = ask_prices[t]
-            curr_bid = bid_prices[t]
-            
-            # 数据清洗：如果盘口缺失，暂用最新价代替
-            if curr_ask <= 0: curr_ask = last_prices[t]
-            if curr_bid <= 0: curr_bid = last_prices[t]
-            
-            current_time = times_str[t]
-            p_hold, p_buy, p_sell = probs_stream[t]
-            
-            # ==========================================
-            # 每日收盘前强制风控
-            # ==========================================
-            if eod_flags[t]:
-                if is_holding:
-                    # 强平
-                    revenue = shares * curr_bid * (1 - cost_rate)
-                    raw_pnl = revenue - (shares * entry_price / (1 - cost_rate))
-                    pnl_pct = (curr_bid - entry_price) / entry_price
-                    
-                    cash += revenue
-                    shares = 0.0
-                    is_holding = False
-                    trades += 1
-                    if raw_pnl > 0: wins += 1
-                    
-                    f.write(f"[{current_time}] 🟢 SELL @ {curr_bid:.4f} | PnL: {raw_pnl:+.2f} ({pnl_pct:.2%}) | Reason: EOD_Clear\n")
-                
-                continue # 收盘时段跳过后续开仓判断
-            
-            # ==========================================
-            # 正常交易逻辑
-            # ==========================================
-            signal = 0; confidence = 0.0
-            if p_buy > p_hold and p_buy > p_sell and p_buy > conf_thresh:
-                signal = 1; confidence = p_buy
-            elif p_sell > p_hold and p_sell > p_buy and p_sell > conf_thresh:
-                signal = 2; confidence = p_sell
-                
-            if not is_holding:
-                if signal == 1: 
-                    scale = min((confidence - conf_thresh) / (1 - conf_thresh), max_pos)
-                    budget = cash * scale
-                    if budget > 2000:
-                        # 用卖一价买入
-                        shares = budget / curr_ask * (1 - cost_rate)
-                        cash -= budget
-                        entry_price = curr_ask 
-                        is_holding = True
-                        
-                        f.write(f"[{current_time}] 🔴 BUY  @ {curr_ask:.4f} | Conf: {confidence:.2f}\n")
-            else:
-                pnl_pct = (curr_bid - entry_price) / entry_price
-                
-                stop_loss = pnl_pct < -0.008
-                signal_lost = p_buy < conf_thresh
-                reverse_signal = signal == 2
-                
-                if stop_loss or signal_lost or reverse_signal:
-                    # 用买一价卖出
-                    revenue = shares * curr_bid * (1 - cost_rate)
-                    raw_pnl = revenue - (shares * entry_price / (1 - cost_rate))
-                    
-                    cash += revenue
-                    shares = 0.0
-                    is_holding = False
-                    trades += 1
-                    if raw_pnl > 0: wins += 1
-                    
-                    reason = "StopLoss" if stop_loss else ("RevSignal" if reverse_signal else "SigLost")
-                    f.write(f"[{current_time}] 🟢 SELL @ {curr_bid:.4f} | PnL: {raw_pnl:+.2f} ({pnl_pct:.2%}) | Reason: {reason}\n")
-
-        # 模拟结束强制结算
-        if is_holding:
-            final_bid = bid_prices[-1] if bid_prices[-1] > 0 else last_prices[-1]
-            cash += shares * final_bid * (1 - cost_rate)
-            f.write(f"[{times_str[-1]}] 🟢 SELL @ {final_bid:.4f} | Reason: Simulation_End\n")
-            
-        final_pnl = cash - initial_cap
-        win_rate = wins / trades if trades > 0 else 0
-        
-        # 写入摘要到文件末尾
-        summary = (
-            f"\n{'='*40}\n"
-            f"[最终结果]\n"
-            f"最终净值: {cash:.2f}\n"
-            f"收益率  : {(cash/initial_cap - 1)*100:.2f}%\n"
-            f"交易次数: {trades} | 胜率: {win_rate:.2%}\n"
-            f"{'='*40}\n"
+        s = i
+        e = i + self.lookback
+        return (
+            torch.from_numpy(self.X_lob[s:e]),
+            torch.from_numpy(self.X_exp[s:e]),
+            torch.tensor(self.Y[e-1], dtype=torch.long),
+            torch.tensor(self.raw_ret[e-1], dtype=torch.float32),
         )
-        f.write(summary)
 
-    # 终端只打印摘要
-    print("\n" + "="*40)
-    print(f"[实盘模拟引擎] 初始: {initial_cap:.0f}")
-    print(f"最终净值: {cash:.2f}")
-    print(f"收益率  : {(cash/initial_cap - 1)*100:.2f}%")
-    print(f"交易次数: {trades} | 胜率: {win_rate:.2%}")
-    print(f"👉 详细日志已保存至: {log_file}")
-    print("="*40)
-    
-    return final_pnl
-def train_system():
-    forge = AlphaForge(CONFIG)
-    try:
-        train_df, test_df = forge.load_and_split()
-    except Exception as e:
-        print(f"数据加载失败: {e}")
-        return
+# ==========================================
+# 5) 回测引擎（迟滞 + 深度约束 + 最小持仓 + 延迟成交）
+# ==========================================
+@torch.no_grad()
+def backtest_evaluate(model: nn.Module, dataloader: DataLoader, cfg: Dict, raw_df: Optional[pd.DataFrame]=None) -> float:
+    model.eval()
+    device = cfg["DEVICE"]
 
-    c = np.bincount(train_df['label'].astype(int), minlength=3)
-    print(f"标签分布: {c}")
-    
-    ds_train = ETFDataset(train_df, CONFIG['LOOKBACK'])
-    # 注意：dl_test 需要 shuffle=False 才能保证时间顺序
-    ds_test = ETFDataset(test_df, CONFIG['LOOKBACK'], scaler=ds_train.scaler)
-    dl_train = DataLoader(ds_train, CONFIG['BATCH_SIZE'], shuffle=True)
-    dl_test = DataLoader(ds_test, CONFIG['BATCH_SIZE'], shuffle=False)
-    
-    model = HybridDeepLOB(ds_train.X_exp.shape[1]).to(CONFIG['DEVICE'])
-    
-    # 类别权重
-    w_hold = 1.0
-    w_buy = c[0]/(c[1]+1)
-    w_sell = c[0]/(c[2]+1)
-    weights = torch.tensor([w_hold, w_buy, w_sell], dtype=torch.float32).to(CONFIG['DEVICE'])
-    print(f"使用权重: {weights.cpu().numpy()}")
-    
-    criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG['LR'], weight_decay=CONFIG['WEIGHT_DECAY'])
-    
-    best_pnl = -np.inf
+    all_probs = []
+    for x_lob, x_exp, _, _ in dataloader:
+        x_lob = x_lob.to(device)
+        x_exp = x_exp.to(device)
+        logits = model(x_lob, x_exp)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+        all_probs.append(probs)
+
+    if not all_probs or raw_df is None:
+        return 0.0
+
+    probs_stream = np.concatenate(all_probs, axis=0)
+    # 预测对齐：Dataset 的第一个预测对应 raw_df 的 index = lookback-1
+    lookback = cfg["LOOKBACK"]
+    sim_df = raw_df.iloc[lookback-1: lookback-1 + len(probs_stream)].copy()
+    if len(sim_df) != len(probs_stream):
+        # 兜底：尾部对齐
+        sim_df = raw_df.tail(len(probs_stream)).copy()
+
+    ask = sim_df["sp1"].values
+    bid = sim_df["bp1"].values
+    ask_v = sim_df.get("sv1", pd.Series(np.inf, index=sim_df.index)).values
+    bid_v = sim_df.get("bv1", pd.Series(np.inf, index=sim_df.index)).values
+    times = sim_df.index
+
+    initial_cap = cfg["INITIAL_CAP"]
+    cash = float(initial_cap)
+    shares = 0.0
+    is_holding = False
+    entry_price = 0.0
+    entry_idx = -1
+
+    cost_rate = cfg["TRADE_COST"]
+    open_th = cfg["CONF_OPEN"]
+    close_th = cfg["CONF_CLOSE"]
+    max_pos = cfg["MAX_POSITION"]
+    stop_loss = cfg["STOP_LOSS_PCT"]
+    min_hold = cfg["MIN_HOLD_BARS"]
+    delay = int(cfg["EXEC_DELAY_BARS"])
+    lot = int(cfg["LOT_SIZE"])
+    min_amt = float(cfg["MIN_TRADE_AMT"])
+    part = float(cfg["LIQ_PARTICIPATION"])
+
+    def is_eod(ts):
+        return (ts.hour == 14 and ts.minute >= 55) or (ts.hour >= 15)
+
+    # 日志
+    log_path = "backtest_log.txt"
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("[Backtest] start\n")
+
+        for t in range(len(probs_stream) - delay):
+            ts = times[t]
+            p_hold, p_buy, p_sell = probs_stream[t]
+
+            # 延迟成交用 t+delay 的盘口
+            ex_ask = ask[t + delay]
+            ex_bid = bid[t + delay]
+            ex_ask_v = ask_v[t + delay] if np.isfinite(ask_v[t + delay]) else np.inf
+            ex_bid_v = bid_v[t + delay] if np.isfinite(bid_v[t + delay]) else np.inf
+
+            # EOD 强制清仓
+            if is_eod(ts):
+                if is_holding:
+                    revenue = shares * ex_bid * (1 - cost_rate)
+                    cash += revenue
+                    pnl = revenue - shares * entry_price * (1 + cost_rate)
+                    f.write(f"[{ts}] SELL(EOD) @ {ex_bid:.4f} shares={shares:.0f} pnl={pnl:+.2f}\n")
+                    shares = 0.0
+                    is_holding = False
+                continue
+
+            # 决策（迟滞）：只对 Buy 做多，Sell 作为退出/风控信号
+            want_buy = (p_buy > p_hold) and (p_buy > p_sell) and (p_buy >= open_th)
+            want_exit = (p_sell > p_buy and p_sell >= open_th) or (p_buy <= close_th)
+
+            if not is_holding:
+                if want_buy:
+                    # 动态仓位
+                    confidence = float(p_buy)
+                    pos = max_pos * (confidence - open_th) / (1.0 - open_th)
+                    pos = float(np.clip(pos, 0.0, max_pos))
+
+                    budget = cash * pos
+                    if budget < min_amt:
+                        continue
+
+                    # 流动性约束：最多吃掉卖一深度的一部分
+                    max_shares_liq = math.floor((ex_ask_v * part) / lot) * lot if np.isfinite(ex_ask_v) else 10**12
+                    # 资金约束
+                    max_shares_cash = math.floor((budget / (ex_ask * (1 + cost_rate))) / lot) * lot
+                    buy_shares = max(0, min(max_shares_liq, max_shares_cash))
+
+                    if buy_shares >= lot:
+                        cost = buy_shares * ex_ask * (1 + cost_rate)
+                        cash -= cost
+                        shares = float(buy_shares)
+                        entry_price = float(ex_ask)
+                        entry_idx = t
+                        is_holding = True
+                        f.write(f"[{ts}] BUY @ {ex_ask:.4f} shares={shares:.0f} p_buy={p_buy:.3f}\n")
+
+            else:
+                # 最短持仓
+                if (t - entry_idx) < min_hold:
+                    continue
+
+                # 止损（按 Bid 估值）
+                pnl_pct = (ex_bid - entry_price) / entry_price
+                if pnl_pct <= -stop_loss:
+                    revenue = shares * ex_bid * (1 - cost_rate)
+                    cash += revenue
+                    pnl = revenue - shares * entry_price * (1 + cost_rate)
+                    f.write(f"[{ts}] SELL(StopLoss) @ {ex_bid:.4f} pnl={pnl:+.2f} ({pnl_pct:.2%})\n")
+                    shares = 0.0
+                    is_holding = False
+                    continue
+
+                if want_exit:
+                    revenue = shares * ex_bid * (1 - cost_rate)
+                    cash += revenue
+                    pnl = revenue - shares * entry_price * (1 + cost_rate)
+                    f.write(f"[{ts}] SELL(Exit) @ {ex_bid:.4f} pnl={pnl:+.2f} p_buy={p_buy:.3f} p_sell={p_sell:.3f}\n")
+                    shares = 0.0
+                    is_holding = False
+                    continue
+
+        # 结算
+        nav = cash
+        if is_holding:
+            nav += shares * bid[-1] * (1 - cost_rate)
+
+        f.write(f"[Backtest] final_nav={nav:.2f} ret={(nav/initial_cap-1):.4%}\n")
+
+    return (nav / initial_cap) - 1.0
+
+
+# ==========================================
+# 6) 训练
+# ==========================================
+def train_system(cfg: Dict = CONFIG):
+    forge = AlphaForge(cfg)
+    train_df, val_df, test_df = forge.load_and_split()
+
+    if train_df.empty or val_df.empty or test_df.empty:
+        raise ValueError("train/val/test 数据为空，请检查数据目录与文件命名")
+
+    ds_train = ETFDataset(train_df, cfg["LOOKBACK"], scaler=None, imputer=None)
+    ds_val = ETFDataset(val_df, cfg["LOOKBACK"], scaler=ds_train.scaler, imputer=ds_train.imputer)
+    ds_test = ETFDataset(test_df, cfg["LOOKBACK"], scaler=ds_train.scaler, imputer=ds_train.imputer)
+
+    dl_train = DataLoader(ds_train, batch_size=cfg["BATCH_SIZE"], shuffle=True, drop_last=True)
+    dl_val = DataLoader(ds_val, batch_size=cfg["BATCH_SIZE"], shuffle=False)
+    dl_test = DataLoader(ds_test, batch_size=cfg["BATCH_SIZE"], shuffle=False)
+
+    device = cfg["DEVICE"]
+    model = HybridDeepLOB(num_exp_features=ds_train.X_exp.shape[1], num_classes=3).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg["LR"], weight_decay=cfg["WEIGHT_DECAY"])
+    criterion = nn.CrossEntropyLoss()
+
+    best_val = -1e9
     patience = 0
-    max_patience = CONFIG['PATIENCE']
-    warmup = CONFIG['WARMUP_EPOCHS']
-    
-    print("\n🔥 开始训练...")
-    for epoch in range(CONFIG['EPOCHS']):
+
+    for epoch in range(cfg["EPOCHS"]):
         model.train()
-        loss_sum = 0
+        losses = []
         for x_lob, x_exp, y, _ in dl_train:
-            x_lob, x_exp, y = x_lob.to(CONFIG['DEVICE']), x_exp.to(CONFIG['DEVICE']), y.to(CONFIG['DEVICE'])
+            x_lob = x_lob.to(device)
+            x_exp = x_exp.to(device)
+            y = y.to(device)
+
             optimizer.zero_grad()
-            out = model(x_lob, x_exp)
-            loss = criterion(out, y)
+            logits = model(x_lob, x_exp)
+            loss = criterion(logits, y)
             loss.backward()
             optimizer.step()
-            loss_sum += loss.item()
-            
-        print(f"Epoch {epoch+1} | Loss: {loss_sum/len(dl_train):.4f}")
-        
-        # [修改] 传入 raw_df=test_df 供事件驱动回测使用
-        pnl = backtest_evaluate(model, dl_test, CONFIG, raw_df=test_df)
-        
-        if pnl > best_pnl:
-            best_pnl = pnl
+            losses.append(loss.item())
+
+        # --- 验证：用更严格的回测做选模 ---
+        val_ret = backtest_evaluate(model, dl_val, cfg, raw_df=val_df)
+        print(f"Epoch {epoch+1:03d} | loss={np.mean(losses):.4f} | val_ret={val_ret:.4%}")
+
+        if epoch < cfg["WARMUP_EPOCHS"]:
+            continue
+
+        if val_ret > best_val:
+            best_val = val_ret
             patience = 0
-            torch.save(model.state_dict(), 'alpha_model_v8_stable.pth')
-            print(">>> 新高! 模型保存.")
+            torch.save(model.state_dict(), "alpha_model_hybriddeeplob.pth")
+            print(f"✅ 保存最好模型: val_ret={best_val:.4%}")
         else:
-            if epoch >= warmup:
-                patience += 1
-                print(f"   -> 未提升 ({patience}/{max_patience})")
-                if patience >= max_patience:
-                    print("早停.")
-                    break
+            patience += 1
+            if patience >= cfg["PATIENCE"]:
+                print("⏹️ 早停触发")
+                break
+
+    # --- 测试评估 ---
+    model.load_state_dict(torch.load("alpha_model_hybriddeeplob.pth", map_location=device))
+    test_ret = backtest_evaluate(model, dl_test, cfg, raw_df=test_df)
+    print(f"\n[Test] ret={test_ret:.4%}")
+
+    # 额外：分类报告（仅供诊断，不做选模依据）
+    model.eval()
+    ys, yp = [], []
+    with torch.no_grad():
+        for x_lob, x_exp, y, _ in dl_test:
+            x_lob = x_lob.to(device); x_exp = x_exp.to(device)
+            logits = model(x_lob, x_exp)
+            pred = torch.argmax(logits, dim=1).cpu().numpy()
+            ys.append(y.numpy()); yp.append(pred)
+    ys = np.concatenate(ys); yp = np.concatenate(yp)
+    print(classification_report(ys, yp, digits=4))
+
+    return model
+
 
 if __name__ == "__main__":
-    train_system()
+    train_system(CONFIG)
