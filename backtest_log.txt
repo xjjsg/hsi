@@ -1,2 +1,0 @@
-[Backtest] start
-[Backtest] final_nav=200000.00 ret=0.0000%
