@@ -1,4 +1,0 @@
-2026-01-07 07:33:15 INFO Auto scheduler started. TZ=Asia/Singapore, target=09:29:35
-2026-01-07 07:33:15 INFO Next run at 2026-01-07T09:29:35+08:00 (sleep 6979.56s)
-2026-01-07 09:29:34 INFO Trigger fired. Start getdata.
-2026-01-07 09:29:34 INFO Running command: C:\ProgramData\anaconda3\envs\env\python.exe c:\Users\1\Desktop\hsi\getdata.py (cwd=c:\Users\1\Desktop\hsi)
