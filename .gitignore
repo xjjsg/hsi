@@ -1,1 +1,19 @@
-/.DS_Store
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Logs
+*.log
+scheduler.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
