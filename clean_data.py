@@ -1,7 +1,13 @@
-#!/usr/bin/env python3
 """
 V1 Historical Data Cleaner
 Converts V1 data format to V2 format with noise filtering and deduplication.
+
+Usage:
+    # Clean a single file
+    python clean_data.py --file data/sz159920/sz159920-2025-11-26.csv --output cleaned/sz159920.csv
+
+    # Batch clean a directory (recursive)
+    python clean_data.py --dir ./data --output ./cleaned_data
 """
 import pandas as pd
 import argparse
