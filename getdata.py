@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GetData V2 智能调度器
+GetData 智能调度器
 
 功能：
 1. 自动检测下一个有效交易时段(A股+港股都开市）
-2. 等待到时间后自动启动 getdata_v2 数据采集
+2. 等待到时间后自动启动 getdata 数据采集
 3. 在非交易时间暂停采集，交易时间恢复
 
 时间窗口：
@@ -207,8 +207,8 @@ class Scheduler:
         
         # 优先尝试直接导入运行 (在同一进程中)
         try:
-            from getdata_v2.main import main as getdata_main
-            # 注意: 如果 getdata_v2.main 没有处理 CancelledError，这里取消时可能会报错
+            from getdata.main import main as getdata_main
+            # 注意: 如果 getdata.main 没有处理 CancelledError，这里取消时可能会报错
             # 但既然是同一进程，asyncio.CancelledError 会在 await 处抛出
             await getdata_main()
             return
@@ -224,7 +224,7 @@ class Scheduler:
         LOGGER.info("切换至 Subprocess 模式启动...")
         import sys
         
-        cmd = [sys.executable, "-m", "getdata_v2.main"]
+        cmd = [sys.executable, "-m", "getdata.main"]
         base_dir = os.path.dirname(os.path.abspath(__file__))
         
         process = await asyncio.create_subprocess_exec(
