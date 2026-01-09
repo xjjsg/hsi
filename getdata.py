@@ -32,9 +32,9 @@ TZ = ZoneInfo(TIMEZONE)
 
 # 采集时间窗口
 TRADING_WINDOWS = [
-    (dt_time(9, 29, 50), dt_time(11, 30, 10)),   # T1: 早盘
+    (dt_time(9, 29, 25), dt_time(11, 30, 10)),   # T1: 早盘
     (dt_time(12, 0, 0), dt_time(12, 0, 30)),      # T2: 午间快照 (A股11:30收 H股12:00收 捕捉套利窗口)
-    (dt_time(12, 59, 50), dt_time(15, 0, 10)),   # T3: 午盘
+    (dt_time(12, 59, 25), dt_time(15, 0, 10)),   # T3: 午盘
 ]
 
 # 日志配置
