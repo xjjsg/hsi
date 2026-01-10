@@ -407,9 +407,7 @@ hsi/
 
 ## 📞 联系方式
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/hsi-hft/issues)
-- **Email**: your.email@example.com
-- **微信**: (可选添加)
+- **Email**: xjjsaikou@gmail.com
 
 ---
 
