@@ -39,6 +39,10 @@ CONFIG = {
     
     # 模拟限制
     "COOLDOWN_BARS": 0,       # 理想模型假设并发能力强，或者设为1表示刚平仓才能开
+    
+    # 交易合并配置
+    "MERGE_GAP_THRESHOLD": 60,    # 合并最大间隔 (秒)
+    "MERGE_COST_THRESHOLD": 2e-4, # 2bps (用于比较是否值得重新开仓)
 }
 
 # ==========================================
@@ -189,62 +193,141 @@ def run_ideal_simulation(df: pd.DataFrame):
 
 
 # ==========================================
-# 4. 交易分析与合并潜力评估
+# 4. 交易合并逻辑 (Chain Merging)
+# ==========================================
+def merge_trades(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    合并连续交易
+    逻辑: 如果 (Buy_Next - Sell_Prev + 2*Cost) > 0，说明"做T"做反了或者空间不够覆盖成本，
+    不如直接持有。
+    """
+    if trades_df.empty:
+        return trades_df
+    
+    merged_list = []
+    
+    # 按入场时间排序
+    df = trades_df.sort_values("entry_time").reset_index(drop=True)
+    n = len(df)
+    
+    # 当前正在累积的交易
+    current_trade = df.iloc[0].to_dict()
+    
+    merge_gap = CONFIG["MERGE_GAP_THRESHOLD"]
+    cost = CONFIG["COST_RATE"]
+    
+    for i in range(1, n):
+        next_trade = df.iloc[i]
+        
+        # 1. 检查时间间隔
+        prev_exit_time = current_trade["exit_time"]
+        next_entry_time = next_trade["entry_time"]
+        gap_sec = (next_entry_time - prev_exit_time).total_seconds()
+        
+        # 2. 检查价格条件 (是否值得合并)
+        # 如果 Entry_Next > Exit_Prev - 2*Cost
+        # 意味着: 重新买回的成本 (Entry_Next + Cost) > 刚才卖出的到手价 (Exit_Prev - Cost)
+        # 即: 卖早了/买贵了，不如一直拿着。
+        
+        entry_price_next = next_trade["entry_price"]
+        exit_price_prev = current_trade["exit_price"]
+        
+        should_merge = False
+        if gap_sec <= merge_gap:
+            # PnL不等式检查
+            # 维持持仓的收益 = Exit_Next - Entry_Current - 2*C
+            # 拆开做的收益 = (Exit_Prev - Entry_Current - 2*C) + (Exit_Next - Entry_Next - 2*C)
+            # 差额 (持有 - 拆开) = Exit_Next - Entry_Current - Exit_Prev + Entry_Current - Exit_Next + Entry_Next + 2*C
+            #                 = Entry_Next - Exit_Prev + 2*C
+            # 如果 差额 > 0，则持有更好。
+            
+            diff = entry_price_next - exit_price_prev + (2 * cost * entry_price_next) # 近似计算
+             # 注意: 严格来说 cost是按成交额算的，这里简化用价格近似
+            
+            if diff > 0:
+                should_merge = True
+        
+        if should_merge:
+            # 执行合并
+            # 更新退出信息为最新的一笔
+            current_trade["exit_time"] = next_trade["exit_time"]
+            current_trade["exit_price"] = next_trade["exit_price"]
+            
+            # 重新计算收益
+            old_entry_price = current_trade["entry_price"]
+            new_exit_price = current_trade["exit_price"]
+            
+            # 更新持仓时间
+            current_trade["hold_seconds"] = (current_trade["exit_time"] - current_trade["entry_time"]).total_seconds()
+            
+            # 更新 PnL 相关字段
+            gross_pnl = (new_exit_price - old_entry_price) / old_entry_price
+            net_pnl = gross_pnl - cost * 2
+            
+            current_trade["profit_bps"] = gross_pnl * 10000
+            current_trade["net_profit_bps"] = net_pnl * 10000
+            
+            # 更新金额 (假设 quantity 不变，或者简单累加？) 
+            # 理想模型每次全仓，所以quantity其实是随资金增长的。这里简化处理：
+            # 仅更新比例收益，金额暂不重新模拟 (因为涉及到复利路径改变，如果要精确需要重跑回测循环)
+            # 在 analyze 阶段我们主要关注 bps 提升。
+            current_trade["pnl_amount"] = 0 # 标记为合并后金额需重算(或忽略)
+            
+            # 记录合并次数(可选)
+            current_trade["merge_count"] = current_trade.get("merge_count", 0) + 1
+            
+        else:
+            # 结束上一笔，开始新的一笔
+            merged_list.append(current_trade)
+            current_trade = next_trade.to_dict()
+            current_trade["merge_count"] = 0
+            
+    # 最后一笔
+    merged_list.append(current_trade)
+    
+    return pd.DataFrame(merged_list)
+
+# ==========================================
+# 5. 交易分析与合并潜力评估
 # ==========================================
 def analyze_trades(trades_df: pd.DataFrame):
     print("\n" + "="*80)
-    print("📊 交易统计与合并潜力分析")
+    print("📊 交易统计与合并分析 (Chain Merging Optimized)")
     print("="*80)
 
-    # 1. 基础统计
-    print("\n[1] 基础统计")
-    print(f"总交易次数: {len(trades_df)}")
-    print(f"平均净收益: {trades_df['net_profit_bps'].mean():.2f} bps")
-    print(f"平均持仓时间: {trades_df['hold_seconds'].mean():.1f} 秒")
-    print("\n盈利分布:")
-    print(trades_df['net_profit_bps'].describe().to_string())
+    # 1. 基础统计 (原始)
+    print("\n[1] 原始策略表现")
+    n_orig = len(trades_df)
+    avg_pnl_orig = trades_df['net_profit_bps'].mean()
+    sum_pnl_orig = trades_df['net_profit_bps'].sum()
+    print(f"交易次数: {n_orig}")
+    print(f"平均净收益: {avg_pnl_orig:.2f} bps")
+    print(f"总净收益: {sum_pnl_orig:.2f} bps")
 
-    # 2. 合并潜力分析
-    # 逻辑: 如果前一笔交易的 exit_time 与 后一笔交易的 entry_time 很近 (例如 < 10秒)
-    # 并且前一笔卖价 ~ 后一笔买价 (考虑点差)，则可能直接持有不卖，省去双边费用。
+    # 2. 执行合并
+    print("\n[2] 执行交易合并...")
+    merged_df = merge_trades(trades_df)
     
-    print("\n[2] 合并潜力分析 (Chain Merging)")
+    # 3. 合并后统计
+    print("\n[3] 合并策略表现")
+    n_merged = len(merged_df)
+    avg_pnl_merged = merged_df['net_profit_bps'].mean()
+    sum_pnl_merged = merged_df['net_profit_bps'].sum()
     
-    trades_df = trades_df.sort_values("entry_time").reset_index(drop=True)
-    trades_df["prev_exit_time"] = trades_df["exit_time"].shift(1)
-    trades_df["prev_exit_price"] = trades_df["exit_price"].shift(1)
+    print(f"交易次数: {n_merged} (减少 {n_orig - n_merged} 笔, -{(n_orig - n_merged)/n_orig*100:.1f}%)")
+    print(f"平均净收益: {avg_pnl_merged:.2f} bps")
+    print(f"总净收益: {sum_pnl_merged:.2f} bps")
     
-    # 计算时间间隔 (秒)
-    trades_df["gap_seconds"] = (trades_df["entry_time"] - trades_df["prev_exit_time"]).dt.total_seconds()
-    
-    # 假设如果 gap < 30秒，且 再次买入价 >= 前次卖出价 * (1 - cost_rate*2) 
-    # (即: 再次买入成本 高于或接近 卖出到手价，说明卖飞了或者白交手续费了)
-    # 这里我们简化逻辑: 只要时间足够短，就视为"连续机会"，统计如果合并能省多少钱
-    
-    # 可合并条件: 间隔小于某阈值 (比如 60秒，即 20 bars)
-    MERGE_GAP_THRESHOLD = 60 
-    
-    potential_merges = trades_df[trades_df["gap_seconds"] < MERGE_GAP_THRESHOLD]
-    
-    num_merges = len(potential_merges)
-    pct_merges = num_merges / len(trades_df)
-    
-    print(f"\n间隔 < {MERGE_GAP_THRESHOLD}秒 的连续交易: {num_merges} 笔 ({pct_merges:.1%})")
-    
-    if num_merges > 0:
-        # 估算节省成本: 每合并且一次，省去一次卖出和一次买入的费用 (约 2 * cost_rate)
-        # 简化计算: 每次合并节省 2 bps
-        saved_costs_bps = 2.0 
-        total_saved_bps = num_merges * saved_costs_bps
+    # 4. 提升分析
+    delta_bps = sum_pnl_merged - sum_pnl_orig
+    print(f"\n[4] 优化效果")
+    print(f"总收益提升: +{delta_bps:.2f} bps")
+    if sum_pnl_orig != 0:
+        print(f"提升幅度: +{delta_bps / abs(sum_pnl_orig) * 100:.2f}%")
         
-        print(f"潜在节省成本 (每笔 {saved_costs_bps} bps): {total_saved_bps:.1f} bps (总计)")
-        print(f"这相当于将总收益提升了: {total_saved_bps / trades_df['net_profit_bps'].sum() * 100:.1%}")
-        
-        # 详细展示前 5 个合并案例
-        print("\n前 5 个可合并案例示例:")
-        print(potential_merges[["entry_time", "gap_seconds", "prev_exit_price", "entry_price"]].head(5).to_string())
-    else:
-        print("无明显的连续交易可合并。")
+    # 保存
+    merged_df.to_csv("trade_log_merged.csv", index=False)
+    print("\n💾 合并后的交易日志已保存至 trade_log_merged.csv")
 
 if __name__ == "__main__":
     try:
