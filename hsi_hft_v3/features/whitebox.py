@@ -528,14 +528,27 @@ class WhiteBoxFeatureFactory:
             f[f"PremSlope_{w}"] = slope_prem
 
         # (11) FX / Index Anchor
-        # Assume these are in bar (but Bar object doesn't have them in spec?)
-        # Spec says "依赖 fx_rate, index_price"
-        # Since I don't have them in `Bar` definition in `bar_builder.py` (checked earlier, allowed fut_*)
-        # I will assume they might be in `extra` dict or just Placeholder 0 if missing.
-        # I'll check `bar` attributes.
-        # If not present, log once and return 0.
-        f["fx_ret"] = 0.0 # Placeholder
-        f["idx_ret"] = 0.0
+        curr_idx = getattr(bar, "index_price", 0)
+        curr_fx = getattr(bar, "fx_rate", 0)
+
+        # State Init (if first bar)
+        if not hasattr(self, "prev_idx_price"): self.prev_idx_price = curr_idx
+        if not hasattr(self, "prev_fx_rate"): self.prev_fx_rate = curr_fx
+        
+        # Log Ret
+        if curr_idx > 0 and self.prev_idx_price > 0:
+            f["idx_ret"] = np.log(curr_idx / self.prev_idx_price)
+        else:
+            f["idx_ret"] = 0.0
+            
+        if curr_fx > 0 and self.prev_fx_rate > 0:
+            f["fx_ret"] = np.log(curr_fx / self.prev_fx_rate)
+        else:
+            f["fx_ret"] = 0.0
+
+        # Update State
+        self.prev_idx_price = curr_idx
+        self.prev_fx_rate = curr_fx
         
         return f
 

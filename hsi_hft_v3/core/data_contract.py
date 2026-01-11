@@ -21,6 +21,8 @@ class Bar:
     # External / Derived
     sentiment: float = 0.0
     premium_rate: float = 0.0
+    index_price: float = 0.0 # Added for V5 Spec
+    fx_rate: float = 0.0     # Added for V5 Spec
     
     # Futures (Target Only, Optional)
     fut_price: Optional[float] = None

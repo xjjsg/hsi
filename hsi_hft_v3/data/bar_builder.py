@@ -62,6 +62,8 @@ class BarBuilder:
             asks=asks,
             sentiment=float(last_row.get("sentiment", 0.0)),
             premium_rate=float(last_row.get("premium_rate", 0.0)),
+            index_price=float(last_row.get("index_price", 0.0)),
+            fx_rate=float(last_row.get("fx_rate", 0.0)),
             fut_price=fut_price,
             fut_imb=fut_imb
         )

@@ -4,19 +4,104 @@ import torch.nn.functional as F
 from hsi_hft_v3.core.config import BLACKBOX_DIM, LOOKBACK_BARS
 
 # Pseudo-Mamba Block (Simplified for prototype, ideally import real mamba_ssm)
-class SimpleSSM(nn.Module):
-    def __init__(self, d_model):
+# Selective Scan (Pure PyTorch Implementation for Windows/CPU compatibility)
+# Strictly follows Mamba: h_t = A_bar * h_{t-1} + B_bar * x_t
+class SelectiveSSM(nn.Module):
+    def __init__(self, d_model, d_state=16, expand=2):
         super().__init__()
-        self.proj = nn.Linear(d_model, d_model)
-        self.conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
+        self.d_model = d_model
+        self.d_inner = d_model * expand
+        self.d_state = d_state
+        
+        # In-projection
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2) 
+
+        # x_proj takes x to (dt, B, C)
+        self.dt_rank = d_model // 16 if d_model // 16 > 0 else 1
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2) 
+        
+        # Parameters
+        # A: (d_inner, d_state)
+        self.A_log = nn.Parameter(torch.log(torch.randn(self.d_inner, d_state).abs()))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        
+        # dt proj
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        
+        self.out_proj = nn.Linear(self.d_inner, d_model)
         self.act = nn.SiLU()
-    
-    def forward(self, x):
-        # x: (B, T, D)
-        x = x.transpose(1, 2) # (B, D, T)
-        x = self.act(self.conv(x))
-        x = x.transpose(1, 2)
-        return self.proj(x)
+
+    def forward(self, u):
+        # u: (B, T, D)
+        B, T, D = u.shape
+        
+        # 1. Expand
+        u_inner = self.in_proj(u)
+        x, z = u_inner.chunk(2, dim=-1) # (B, T, d_inner)
+        
+        # 2. Conv1d (Short local conv) - standard Mamba block has this before SSM
+        # For strict compliance, we should use a conv here or assume pre-conv.
+        # User spec mentions "MambaEncoder" -> "SimpleSSM". 
+        # In Mamba paper: Block = Conv -> SSM -> Gated MLP.
+        # We will assume 'x' input here needs the SSM part.
+        
+        # 3. Dynamic Projections (Selection)
+        # Scan Input x: (B, T, d_inner)
+        # Params: (B, T, dt_rank + 2*d_state)
+        delta_bc = self.x_proj(x)
+        
+        # Split
+        delta_raw, B_ssm, C_ssm = torch.split(delta_bc, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        
+        # Softplus delta
+        delta = F.softplus(self.dt_proj(delta_raw)) # (B, T, d_inner)
+        
+        # 4. Discretization
+        # A_bar = exp(delta * A)
+        # B_bar = (delta * A)^-1 (exp(delta * A) - I) * delta * B  ~ approx delta * B
+        
+        A = -torch.exp(self.A_log) # A must be negative
+        
+        # Sequential Scan (Slow but Correct Pure Torch)
+        # h_t = A_bar_t * h_{t-1} + B_bar_t * x_t
+        # y_t = C_t * h_t
+        
+        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device)
+        y_list = []
+        
+        for t in range(T):
+            # Slice time t
+            dt_t = delta[:, t, :] # (B, d_inner)
+            dA = torch.exp(torch.einsum('bd,dn->bdn', dt_t, A)) # (B, d_inner, d_state)
+            dB = torch.einsum('bd,bn->bdn', dt_t, B_ssm[:, t, :]) # (B, d_inner, d_state)
+            
+            xt = x[:, t, :] # (B, d_inner)
+            
+            # Recurrence
+            # h: (B, d_inner, d_state)
+            # x_t * dB -> (B, d_inner, 1) * (B, d_inner, d_state) ??
+            # Wait, standard SISO: x_t is scalar per channel. 
+            # In Mamba D_inner channels are independent.
+            # So x_t (B, d_inner) broadcasts to (B, d_inner, 1)
+            
+            h = h * dA + xt.unsqueeze(-1) * dB
+            
+            # Output y_t = h_t * C_t
+            # C_ssm: (B, d_state) -> Shared across channels? 
+            # In Mamba, C is (B, T, d_state). 
+            # Projection: y = sum(h * C, dim=-1) -> (B, d_inner)
+            
+            Ct = C_ssm[:, t, :] # (B, d_state)
+            yt = torch.einsum('bdn,bn->bd', h, Ct)
+            y_list.append(yt)
+            
+        y = torch.stack(y_list, dim=1) # (B, T, d_inner)
+        
+        # 5. Residual + Gate
+        y = y + x * self.D.unsqueeze(0).unsqueeze(0)
+        y = y * self.act(z)
+        
+        return self.out_proj(y)
 
 class LocalLOBEncoder(nn.Module):
     def __init__(self, input_dim, d_model):
@@ -63,8 +148,8 @@ class DeepFactorMinerV5(nn.Module):
         self.encoder_aux = LocalLOBEncoder(input_dim_raw, d_model)
         
         # SSM Backbone (Mamba-like)
-        self.ssm_tgt = SimpleSSM(d_model)
-        self.ssm_aux = SimpleSSM(d_model)
+        self.ssm_tgt = SelectiveSSM(d_model)
+        self.ssm_aux = SelectiveSSM(d_model)
         
         # Fusion
         self.film = FiLMFusion(d_model)
