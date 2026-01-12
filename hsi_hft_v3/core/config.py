@@ -29,7 +29,7 @@ class ExecutionConfig:
 PREDICT_HORIZON_S = 120    # H* = 120s
 K_BARS = PREDICT_HORIZON_S // BAR_SIZE_S  # 40 bars
 LOOKBACK_BARS = 100        # Feature window
-BLACKBOX_DIM = 16          # Latent dimension (Spec Requirement)
+BLACKBOX_DIM = 32          # Latent dimension (Spec Requirement)
 
 @dataclass
 class LabelConfig:
