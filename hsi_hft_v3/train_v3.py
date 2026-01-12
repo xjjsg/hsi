@@ -11,7 +11,7 @@ from hsi_hft_v3.data.loader import V5DataLoader
 from hsi_hft_v3.features.whitebox import WhiteBoxFeatureFactory
 from hsi_hft_v3.features.blackbox import DeepFactorMinerV5
 from hsi_hft_v3.models.heads import HitHead, HazardHead, RiskHead, ResidualCombine
-from hsi_hft_v3.core.config import BLACKBOX_DIM, K_BARS, COST_RATE
+from hsi_hft_v3.core.config import BLACKBOX_DIM, K_BARS, COST_RATE, LATENCY_BARS, LabelConfig
 
 # PyTorch Imports
 try:
@@ -42,8 +42,11 @@ def generate_labels(samples, lookahead=60):
     y_risk = np.zeros(n, dtype=np.float32)
     
     # Pre-extract prices for speed
+    asks = np.array([s.target.asks[0][0] if s.target.asks else np.nan for s in samples])
+    bids = np.array([s.target.bids[0][0] if s.target.bids else np.nan for s in samples])
+
     # We need Ask_e = Ask[t + latency]
-    latency = 1 # fixed 1 bar for now (as per config, but hardcoded here for speed or read from config)
+    latency = LATENCY_BARS # fixed 1 bar for now
     
     # Cost threshold
     # Profit = (Bid_future - Ask_entry) / Ask_entry - 2*Cost
@@ -57,7 +60,7 @@ def generate_labels(samples, lookahead=60):
         if np.isnan(entry_price): continue
         
         target_price = entry_price * (1.0 + 2 * COST_RATE + 0.0002) # Min profit 2bps net
-        stop_price = entry_price * (1.0 - 0.0005)
+        stop_price = entry_price * (1.0 - LabelConfig.adverse_bps/10000.0) # Stop loss from Config
         
         found_hit = False
         hit_k = K_BARS - 1 
@@ -135,13 +138,11 @@ def train():
         for s in samples:
             # Whitebox
             wb_out = wb_factory.compute(s)
-            # Flatten Z-scores only
-            # FIX: Ensure deterministic key order and no missing keys. 
-            # We assume all keys are present for all samples due to WhiteBox logic.
-            # But dict iteration order might vary or keys might shift.
-            # Let's sort keys.
-            sorted_keys = sorted([k for k in wb_out["white_derived"].keys() if "_z_" in k])
-            z_feats = [wb_out["white_derived"][k] for k in sorted_keys]
+            # FIX: Ensure deterministic key order using factory helper
+            sorted_keys = wb_factory.get_derived_keys()
+            z_feats = []
+            for k in sorted_keys:
+                z_feats.append(wb_out["white_derived"].get(k, 0.0))
             
             # Additional check:
             # If length varies across samples, we still crash.

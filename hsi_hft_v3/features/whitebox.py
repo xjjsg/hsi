@@ -149,6 +149,52 @@ class WhiteBoxFeatureFactory:
         # Helper to init stats map
         self._init_stat_keys()
 
+    def get_derived_keys(self) -> List[str]:
+        """
+        Return the deterministic list of feature keys (Audit requirement).
+        Order: For each raw_feature (sorted), for each window (sorted), z then slope.
+        """
+        # Hardcoded raw feature names based on mining logic
+        # This list MUST match what is produced in compute()
+        raw_names = [
+            "QI_L1", "QI_L5", "iOFI", "nBSP", "mp_dev_bps",
+            "CFT_fast", "CFT_slow", "LLT_rs", "leadlag_corr_max", "leadlag_lag", "flow_ratio",
+            "idx_ret", "fx_ret"
+        ]
+        # Weighted raw features (VPIN_{w}, etc)
+        for w in self.W_set:
+            raw_names.append(f"VPIN_{w}")
+            raw_names.append(f"KyleLambda_{w}")
+            raw_names.append(f"FPD_{w}")
+            raw_names.append(f"PFA_{w}")
+            raw_names.append(f"PremZ_{w}")
+            raw_names.append(f"PremSlope_{w}")
+            raw_names.append(f"DynBeta_{w}")
+            raw_names.append(f"Divergence_{w}")
+            raw_names.append(f"SyncIOFI_{w}")
+            # Aux keys
+            raw_names.append(f"aux_QI_L1")
+            raw_names.append(f"aux_QI_L5")
+            raw_names.append(f"aux_iOFI")
+            raw_names.append(f"aux_nBSP")
+            raw_names.append(f"aux_mp_dev_bps")
+            raw_names.append(f"aux_VPIN_{w}")
+            raw_names.append(f"aux_KyleLambda_{w}")
+
+        # Futures
+        raw_names.append("FLP")
+        raw_names.append("FSB")
+        
+        raw_names.sort()
+        
+        final_keys = []
+        for name in raw_names:
+            for w in [20, 100, 600]: # Explicit W_set for stability
+                final_keys.append(f"{name}_z_{w}")
+                final_keys.append(f"{name}_slope_{w}")
+                
+        return final_keys
+
     def _init_stat_keys(self):
         # We define which raw features need unified Z/Slope
         # This is dynamic, checked in compute loop

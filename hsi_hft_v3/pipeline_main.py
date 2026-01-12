@@ -99,8 +99,13 @@ def main():
         for i, s in enumerate(samples):
             # A. WhiteBox
             wb_out = wb_factory.compute(s)
-            z_feats = [v for k,v in wb_out["white_derived"].items() if "_z_" in k]
-            if not z_feats: z_feats = [0.0]*DIM_WHITE
+            # Use deterministic keys
+            sorted_keys = wb_factory.get_derived_keys()
+            z_feats = []
+            for k in sorted_keys:
+                z_feats.append(wb_out["white_derived"].get(k, 0.0))
+            
+            if not z_feats: z_feats = [0.0]*len(sorted_keys) # Should not happen with get_derived_keys
             
             # B. Raw Buffers
             t_vec = [s.target.mid/1000.0, s.target.vwap/1000.0 if s.target.vwap else 0, np.log1p(s.target.volume)]

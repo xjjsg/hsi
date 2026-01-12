@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, List
+from hsi_hft_v3.core.config import COST_RATE
 
 def calculate_metrics(trades: List[Dict], equity_curve: List[Dict], initial_cap: float = 1e6) -> Dict:
     """Detailed V4-style metrics"""
@@ -45,7 +46,7 @@ def calculate_metrics(trades: List[Dict], equity_curve: List[Dict], initial_cap:
     # Cost Analysis
     # Estimate total cost paid
     total_vol_traded = buys["qty"].sum() + sells["qty"].sum()
-    est_cost = total_vol_traded * buys["px"].mean() * 0.0001 # approx
+    est_cost = total_vol_traded * buys["px"].mean() * COST_RATE # approx
     
     return {
         "n_trades": len(buys),

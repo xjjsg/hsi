@@ -18,6 +18,15 @@ class BarBuilder:
         # 2. Add bucket time
         df["ts_bucket"] = (df["tx_local_time"] // self.bucket_ms) * self.bucket_ms
         
+        # 3. Slow Variable Forward Fill (V5 Spec Req)
+        # Slow vars: iopv, index_price, fx_rate, sentiment, premium_rate
+        slow_cols = ["iopv", "index_price", "fx_rate", "sentiment", "premium_rate"]
+        for c in slow_cols:
+             if c in df.columns:
+                 df[c] = df[c].ffill()
+                 # Optional: missing mask? Spec says 'missing_mask' in Bar?
+                 # Start simple: ffill ensures we don't have zeros in bars between ticks.
+        
         bars = []
         for ts, group in df.groupby("ts_bucket"):
             bar = self._aggregate_group(ts, group)
@@ -64,6 +73,7 @@ class BarBuilder:
             premium_rate=float(last_row.get("premium_rate", 0.0)),
             index_price=float(last_row.get("index_price", 0.0)),
             fx_rate=float(last_row.get("fx_rate", 0.0)),
+            iopv=float(last_row.get("iopv", 0.0)),
             fut_price=fut_price,
             fut_imb=fut_imb
         )

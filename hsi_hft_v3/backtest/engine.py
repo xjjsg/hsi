@@ -80,6 +80,10 @@ class BacktestEngine:
             self._execute(order, sample)
             
     def _execute(self, order: Order, sample: AlignedSample):
+        # 0. Safety Check
+        from hsi_hft_v3.core.config import TARGET_SYMBOL
+        assert sample.target.symbol == TARGET_SYMBOL, f"CRITICAL: Attempting to trade wrong symbol {sample.target.symbol}"
+
         # Taker Execution @ L1
         if order.action == "BUY":
             # Buy @ Ask1
