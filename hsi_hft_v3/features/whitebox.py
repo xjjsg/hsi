@@ -413,6 +413,15 @@ class WhiteBoxFeatureFactory:
             
         f["nBSP"] = get_imb(0) - get_imb(4)
         
+        # (3b) Spread BPS (Explicit for Policy)
+        # spread_bps = (ask - bid) / mid * 10000
+        mid = v["mid"]
+        spread = v["spread"]
+        if mid > 0:
+            f["spread_bps"] = (spread / mid) * 10000.0
+        else:
+            f["spread_bps"] = 0.0
+        
         # (4) Microprice Deviation
         # mp = (bp*sv + sp*bv) / (bv+sv)
         mp = (v["bp1"] * v["sv1"] + v["sp1"] * v["bv1"]) / (v["bv1"] + v["sv1"] + EPS)
@@ -749,8 +758,8 @@ class WhiteBoxFeatureFactory:
         
         # (18) Co-Imbalance Sync
         # iOFI from A1 output
-        iofi_t = a1_t.get("tgt_iOFI", 0)
-        iofi_a = a1_a.get("aux_iOFI", 0)
+        iofi_t = a1_t.get("iOFI", 0)
+        iofi_a = a1_a.get("iOFI", 0)
         
         for w in self.W_set:
             cv = self._get_cov("sync_iofi", w)

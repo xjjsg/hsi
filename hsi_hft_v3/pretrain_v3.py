@@ -16,10 +16,11 @@ except ImportError:
     print("PyTorch missing.")
     sys.exit(1)
 
-from hsi_hft_v3.data.loader import V5DataLoader
+# 导入整合后的模块
+from hsi_hft_v3.data_layer import V5DataLoader
+from hsi_hft_v3.trading_layer import BLACKBOX_DIM
+from hsi_hft_v3.model_layer import DeepFactorMinerV5, vicreg_loss
 from hsi_hft_v3.features.whitebox import WhiteBoxFeatureFactory
-from hsi_hft_v3.features.blackbox import DeepFactorMinerV5, vicreg_loss
-from hsi_hft_v3.core.config import BLACKBOX_DIM
 
 class LatentPredictor(nn.Module):
     """Simple MLP to predict future latent state from current state"""

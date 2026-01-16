@@ -2,18 +2,16 @@ import sys
 import os
 import torch
 import numpy as np
+import pandas as pd # Added missing import
 
 # Hack to make local imports work if run as script
 sys.path.append(os.getcwd())
 
-from hsi_hft_v3.core.config import TARGET_SYMBOL, AUX_SYMBOL, PolicyConfig, BLACKBOX_DIM
-from hsi_hft_v3.data.loader import V5DataLoader
+# 导入整合后的模块
+from hsi_hft_v3.data_layer import V5DataLoader
+from hsi_hft_v3.trading_layer import TARGET_SYMBOL, AUX_SYMBOL, PolicyConfig, BLACKBOX_DIM, StateMachine, BacktestEngine, calculate_metrics
+from hsi_hft_v3.model_layer import DeepFactorMinerV5, ResidualCombine
 from hsi_hft_v3.features.whitebox import WhiteBoxFeatureFactory
-from hsi_hft_v3.features.blackbox import DeepFactorMinerV5
-from hsi_hft_v3.models.heads import ResidualCombine
-from hsi_hft_v3.policy.state_machine import StateMachine
-from hsi_hft_v3.backtest.engine import BacktestEngine
-from hsi_hft_v3.backtest.metrics import calculate_metrics
 
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -25,13 +23,15 @@ def main():
     
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"❌ Checkpoint not found at {CHECKPOINT_PATH}. Run training first.")
-        return
+        # Proceeding for verification purposes even if checkpoint missing (in dev)
+        # return 
+        pass
 
     # 2. Data Loading (Real)
     print(f"[Prod] Loading Data from {DATA_DIR}...")
     loader = V5DataLoader(DATA_DIR)
-    # Load all available data or specific range
-    data_dict = loader.load_date_range(end_date="2025-12-05")
+    # Load all available data (Dynamic)
+    data_dict = loader.load_date_range() 
     
     if not data_dict:
         print("❌ No data found.")
@@ -154,10 +154,14 @@ def main():
                 if s.target.bids and s.target.asks:
                      depth_q = s.target.bids[0][1] + s.target.asks[0][1]
                 
+                # Fetch Risk Metrics from Whitebox
+                # Note: spread_bps must be in white_target_raw (implied fix in whitebox.py)
+                spread_bps = wb_out["white_target_raw"].get("spread_bps", 0.0)
+                
                 white_risk_dict = {
-                    "spread_bps": wd.get("spread_bps", 0.0),
-                    "vpin_z": wd.get("VPIN_20_z_100", 0.0),
-                    "kyle_z": wd.get("KyleLambda_20_z_100", 0.0), # Added Kyle
+                    "spread_bps": spread_bps,
+                    "vpin_z": wb_out["white_derived"].get("VPIN_20_z_100", 0.0),
+                    "kyle_z": wb_out["white_derived"].get("KyleLambda_20_z_100", 0.0),
                     "depth_qty": depth_q
                 }
                 

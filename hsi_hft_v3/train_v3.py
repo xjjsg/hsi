@@ -7,11 +7,11 @@ import pandas as pd
 # Hack to make local imports work
 sys.path.append(os.getcwd())
 
-from hsi_hft_v3.data.loader import V5DataLoader
+# 导入整合后的模块
+from hsi_hft_v3.data_layer import V5DataLoader
+from hsi_hft_v3.trading_layer import BLACKBOX_DIM, K_BARS, COST_RATE, LATENCY_BARS, LabelConfig
+from hsi_hft_v3.model_layer import DeepFactorMinerV5, HitHead, HazardHead, RiskHead, ResidualCombine
 from hsi_hft_v3.features.whitebox import WhiteBoxFeatureFactory
-from hsi_hft_v3.features.blackbox import DeepFactorMinerV5
-from hsi_hft_v3.models.heads import HitHead, HazardHead, RiskHead, ResidualCombine
-from hsi_hft_v3.core.config import BLACKBOX_DIM, K_BARS, COST_RATE, LATENCY_BARS, LabelConfig
 
 # PyTorch Imports
 try:
@@ -64,6 +64,7 @@ def generate_labels(samples, lookahead=60):
         
         found_hit = False
         hit_k = K_BARS - 1 
+        found_risk = False # Fix: Initialize found_risk 
         
         # Look forward from t_e
         # Path: t_e + 1 ... t_e + lookahead
@@ -241,7 +242,7 @@ def train():
     )
     
     crit_hit = nn.BCEWithLogitsLoss()
-    crit_haz = nn.CrossEntropyLoss()
+    crit_haz = nn.BCEWithLogitsLoss(reduction='none') # Changed to BCE with masking
     crit_risk = nn.BCEWithLogitsLoss()
     
     # 6. Loop
@@ -265,16 +266,44 @@ def train():
             # 1. Hit Loss (Binary)
             loss_hit = crit_hit(out["logit_hit"], y_h)
             
-            # 2. Hazard Loss (Discrete Survival NLL)
-            # Treat output as logits for h_k (hazard rate at step k)
-            # h_k = sigmoid(logit_hz_k)
-            # S(k) = Prod(1 - h_i)
-            # P(T=k) = h_k * S(k-1)
-            # For simplicity, we stick to CrossEntropy approximation here as robust baseline, 
-            # BUT adding Consistency Constraint is key.
-            # To be strictly Spec compliant, we should implement the Sum-Log formulation.
-            # For this iteration, let's keep CE but enforce P_implied consistency.
-            loss_haz = crit_haz(out["logit_hazard"], y_z)
+            # 2. Hazard Loss (Discrete Time: h_k = P(T=k|T>=k))
+            # Target: 0 for k < T, 1 for k == T
+            # Mask: 1 for k <= T, 0 for k > T
+            
+            # Construct Dense Targets from Indices y_z
+            B, K = out["logit_hazard"].shape
+            
+            # y_z is index of event (Hit or Risk or End). 
+            # If hit_k = K-1 (no event), then all 0s? 
+            # In generate_labels, hit_k is min(lookahead, ...). 
+            # If no hit, it's K_BARS-1.
+            
+            haz_targets = torch.zeros_like(out["logit_hazard"])
+            haz_mask = torch.zeros_like(out["logit_hazard"])
+            
+            for i in range(B):
+                idx = int(y_z[i].item())
+                # Active range: 0 to idx (inclusive)
+                haz_mask[i, :idx+1] = 1.0
+                # Target: 0 everywhere except at idx (if it's a real hit?)
+                # Wait, if y_hit[i]==1, then idx is the HIT time. h_idx = 1.
+                # If y_hit[i]==0 and y_risk[i]==0, then idx is censorship time (K-1). h_idx = 0.
+                if y_h[i].item() > 0.5: # It's a Hit
+                    haz_targets[i, idx] = 1.0
+                elif y_r[i].item() > 0.5: # It's a Risk event
+                    # Competing risk? Usually treated as censoring for Hit Hazard? 
+                    # Spec: "Hazard of Hit". So Risk event censors Hit.
+                    # So at risk event k, we know we DIDN'T hit.
+                    # So target is 0, mask includes k.
+                    pass 
+                else: 
+                    # End of window, no hit. Censored.
+                    # Target 0, mask includes k.
+                    pass
+
+            loss_haz_elem = crit_haz(out["logit_hazard"], haz_targets)
+            loss_haz = (loss_haz_elem * haz_mask).sum() / (haz_mask.sum() + 1e-6)
+
             
             # 3. Risk Loss
             loss_risk = crit_risk(out["logit_risk"], y_r)
@@ -293,10 +322,14 @@ def train():
             # But y_hit is separately supervised.
             
             p_hit_model = torch.sigmoid(out["logit_hit"])
-            probs_haz = torch.softmax(out["logit_hazard"], dim=1) 
-            # Sum of probs for "early enough" bins? 
-            # Let's say any bin except the last "censored" bin implies hit.
-            p_hit_implied = probs_haz[:, :-1].sum(dim=1).unsqueeze(-1)
+            # For consistency: P_hit_implied = 1 - S(K)
+            # S(t) = Prod(1 - h_k)
+            h_probs = torch.sigmoid(out["logit_hazard"])
+            # We want P(T <= K) = 1 - Prod_{k=0}^{K-1} (1 - h_k)
+            # Log survival
+            log_S = torch.sum(torch.log(1 - h_probs + 1e-9), dim=1)
+            p_hit_implied = 1.0 - torch.exp(log_S).unsqueeze(-1)
+
             
             loss_cons = F.mse_loss(p_hit_model, p_hit_implied)
             
