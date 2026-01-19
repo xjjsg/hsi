@@ -1,0 +1,69 @@
+# ================================
+# HSI HFT 个人项目 .gitignore
+# ================================
+
+# Python 编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# ================================
+# 项目临时文件（不提交）
+# ================================
+
+# 运行日志
+logs/
+*.log
+
+# 输出结果
+outputs/
+
+# ================================
+# 模型文件（可选配置）
+# ================================
+
+# 如果模型文件很大（>100MB），取消下面注释
+# checkpoints/*.pth
+# checkpoints/*.pt
+# checkpoints/*.ckpt
+
+# ================================
+# 系统文件
+# ================================
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# ================================
+# 重要：data/ 不在忽略列表
+# ================================
+# data/ 目录会被提交到 Git
+# 如果数据文件太大，考虑使用 Git LFS:
+#   git lfs track "data/**/*.csv"
