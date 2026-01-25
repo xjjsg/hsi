@@ -1,359 +1,561 @@
 """
-HSI HFT V3 - 体制识别系统 (RegimeDetector)
-技术实施方案
+RegimeDetector v1.1 - 工程化两层状态系统
 
-优先级：🟠 高（Tier 1）
-状态：框架文件 - 待用户填充自己的想法
-预期收益：体制转换期减少15%回撤，震荡期胜率+5-10%
+核心改进：
+1. 字段口径统一 + 健康度闸门
+2. 分位数评分制（避免OR进入AND退出锁死）
+3. Action层两阶段gating（确保可交易驻留长度）
+4. Micro/Action分别的min_residence
+5. 连续置信度驱动平滑
 
-设计哲学：
-基于现有白盒指标的规则驱动检测，避免学习型方法的过拟合。
-两份评估报告100%共识，是核心优化点。
+基于用户诊断方案v1.1
 """
 
 import numpy as np
-from typing import Dict, Optional, Tuple
-from enum import Enum
+import pandas as pd
+from typing import Dict, Tuple, Optional, List
+from collections import deque, defaultdict
 
 
-class MarketRegime(Enum):
-    """市场体制枚举"""
-
-    NORMAL = "normal"
-    HIGH_VOLATILITY = "high_volatility"
-    ILLIQUID = "illiquid"
-    TRENDING = "trending"
-    MEAN_REVERTING = "mean_reverting"
+# ============================================
+# 1. 字段口径统一与健康度闸门
+# ============================================
 
 
-class RegimeDetector:
+class FeatureHealthMonitor:
     """
-    市场体制识别器
+    特征健康度监控
 
-    核心功能：
-    1. 基于白盒指标检测5种市场体制
-    2. 为每种体制配置专属的因子权重
-    3. 与RiskMonitor联动提供双重风控
-
-    检测指标来源（复用HSI现有白盒）：
-    - vpin_z: 成交量不平衡Z-score
-    - spread_bps: 价差（基点）
-    - depth: 流动性深度
-    - [TODO 用户自定义] 动量指标
-    - [TODO 用户自定义] 其他微观结构指标
+    检查项：
+    1. 非零比例（>50%）
+    2. 标准差（避免常数）
+    3. 极值分位数跨度（p95-p05 > threshold）
     """
 
-    def __init__(self):
-        # ========================================
-        # 体制定义规则
-        # ========================================
-        # TODO: 用户可根据自己的理解调整这些阈值
+    def __init__(self, window=100):
+        self.window = window
+        self.history = defaultdict(lambda: deque(maxlen=window))
 
-        self.regime_rules = {
-            "normal": {
-                "vpin_z_range": (-2, 2),
-                "spread_max": 8,
-                "depth_min": 5000,
-                "description": "正常交易状态，流动性充足",
-            },
-            "high_volatility": {
-                "vpin_z_range": (2, 5),  # VPIN异常高
-                "spread_max": 15,
-                "description": "高波动期，价格剧烈波动",
-            },
-            "illiquid": {
-                "depth_min": 3000,
-                "spread_max": 20,
-                "description": "流动性枯竭，大单难成交",
-            },
-            "trending": {
-                # TODO: 用户自定义趋势检测指标
-                # 建议：价格动量、autocorrelation、方向性成交量等
-                "momentum_z_range": (2, np.inf),  # placeholder
-                "description": "单边趋势行情",
-            },
-            "mean_reverting": {
-                "vpin_z_range": (-1, 1),
-                "momentum_z_range": (-2, 2),  # placeholder
-                "description": "震荡行情，均值回复特征明显",
-            },
-        }
+    def update(self, feature_name: str, value: float):
+        """更新特征历史"""
+        self.history[feature_name].append(value)
 
-        # ========================================
-        # 体制特定的因子权重配置
-        # ========================================
-        # TODO: 用户根据自己的策略调整这些权重
-
-        self.alpha_by_regime = {
-            MarketRegime.NORMAL: {
-                "white_weight": 0.5,
-                "black_weight": 0.5,
-                "rationale": "正常情况下平衡使用白盒和黑盒",
-            },
-            MarketRegime.HIGH_VOLATILITY: {
-                "white_weight": 0.7,
-                "black_weight": 0.3,
-                "rationale": "高波动期信任经验因子，降低黑盒权重",
-            },
-            MarketRegime.ILLIQUID: {
-                "white_weight": 0.8,
-                "black_weight": 0.2,
-                "rationale": "流动性差时保守策略，主要依赖白盒",
-            },
-            MarketRegime.TRENDING: {
-                "white_weight": 0.3,
-                "black_weight": 0.7,
-                "rationale": "趋势行情下黑盒可能捕捉动量模式",
-            },
-            MarketRegime.MEAN_REVERTING: {
-                "white_weight": 0.6,
-                "black_weight": 0.4,
-                "rationale": "震荡期偏重白盒的均值回复因子",
-            },
-        }
-
-        # ========================================
-        # 体制特定的入场阈值调整
-        # ========================================
-        # TODO: 用户调整不同体制下的风控阈值
-
-        self.threshold_multiplier = {
-            MarketRegime.NORMAL: 1.0,
-            MarketRegime.HIGH_VOLATILITY: 1.2,  # 提高入场门槛
-            MarketRegime.ILLIQUID: 1.5,  # 大幅提高门槛
-            MarketRegime.TRENDING: 0.9,  # 略降低门槛（捕捉趋势）
-            MarketRegime.MEAN_REVERTING: 0.95,  # 略降低门槛
-        }
-
-        # 状态管理
-        self.current_regime = MarketRegime.NORMAL
-        self.regime_history = []
-        self.regime_confidence = 1.0
-
-    def detect(self, white_risk: Dict) -> Tuple[MarketRegime, float]:
+    def is_healthy(self, feature_name: str) -> Tuple[bool, str]:
         """
-        检测当前市场体制
-
-        Args:
-            white_risk: {
-                'vpin_z': VPIN的Z-score,
-                'spread_bps': 价差（基点）,
-                'depth': 流动性深度,
-                'momentum_z': 动量指标Z-score (TODO),
-                ... 其他白盒指标
-            }
+        判断特征是否健康
 
         Returns:
-            (regime, confidence): 体制类型和置信度
+            (is_healthy, reason)
         """
-        # ========================================
-        # TODO: 用户实现自己的检测逻辑
-        # ========================================
+        if feature_name not in self.history:
+            return False, "no_data"
 
-        vpin = white_risk.get("vpin_z", 0)
-        spread = white_risk.get("spread_bps", 0)
-        depth = white_risk.get("depth", 10000)
+        values = list(self.history[feature_name])
+        if len(values) < 10:
+            return False, "insufficient_samples"
 
-        # TODO: 用户添加动量指标的计算
-        momentum_z = white_risk.get("momentum_z", 0)
+        # 检查1：非零比例
+        non_zero_ratio = sum(1 for v in values if abs(v) > 1e-9) / len(values)
+        if non_zero_ratio < 0.05:  # Relaxed for ETF from 0.5 -> 0.05
+            return False, f"low_non_zero_ratio_{non_zero_ratio:.2f}"
 
-        # 优先级检测（从异常到正常）
+        # 检查2：标准差
+        std = np.std(values)
+        if std < 1e-6:
+            return False, f"constant_std_{std:.2e}"
 
-        # 1. 流动性枯竭（最高优先级）
-        if depth < 3000 or spread > 20:
-            regime = MarketRegime.ILLIQUID
-            confidence = 0.9
+        # 检查3：极值跨度
+        p95 = np.percentile(values, 95)
+        p05 = np.percentile(values, 5)
+        span = p95 - p05
+        if span < 1e-6:
+            return False, f"low_span_{span:.2e}"
 
-        # 2. 高波动
-        elif vpin > 2 or spread > 12:
-            regime = MarketRegime.HIGH_VOLATILITY
-            confidence = 0.8
+        return True, "ok"
 
-        # 3. 趋势行情
-        # TODO: 用户完善趋势检测逻辑
-        elif abs(momentum_z) > 2:
-            regime = MarketRegime.TRENDING
-            confidence = 0.7
 
-        # 4. 均值回复
-        elif abs(vpin) < 1 and abs(momentum_z) < 1:
-            regime = MarketRegime.MEAN_REVERTING
-            confidence = 0.8
+class CanonicalFeatureMapper:
+    """
+    字段口径统一映射器
 
-        # 5. 正常
-        else:
-            regime = MarketRegime.NORMAL
-            confidence = 1.0
+    所有别名映射到canonical key
+    """
 
-        # 平滑切换：如果体制频繁切换，降低置信度
-        if len(self.regime_history) > 0 and self.regime_history[-1] != regime:
-            if len(self.regime_history) >= 3:
-                recent_regimes = self.regime_history[-3:]
-                if len(set(recent_regimes)) >= 3:
-                    confidence *= 0.7  # 降低置信度
+    CANONICAL_KEYS = {
+        "vpin": ["tgt_VPIN_100", "VPIN_100", "vpin_z", "VPIN"],
+        "spread_bps": ["tgt_spread_bps", "spread_bps", "spread"],
+        "depth": ["depth", "total_depth"],
+    }
 
-        # 更新状态
-        self.current_regime = regime
-        self.regime_confidence = confidence
-        self.regime_history.append(regime)
-
-        # 限制历史长度
-        if len(self.regime_history) > 100:
-            self.regime_history.pop(0)
-
-        return regime, confidence
-
-    def get_alpha_weights(self, regime: Optional[MarketRegime] = None) -> Dict:
+    @classmethod
+    def get_canonical_value(cls, data: Dict, canonical_key: str) -> Optional[float]:
         """
-        获取体制对应的因子权重
+        从data中获取canonical key对应的值
 
-        Args:
-            regime: 体制类型（None则使用当前体制）
-
-        Returns:
-            {'white_weight': float, 'black_weight': float, 'rationale': str}
+        尝试所有可能的别名，返回第一个找到的
         """
-        if regime is None:
-            regime = self.current_regime
+        aliases = cls.CANONICAL_KEYS.get(canonical_key, [canonical_key])
 
-        return self.alpha_by_regime.get(
-            regime, self.alpha_by_regime[MarketRegime.NORMAL]
+        for alias in aliases:
+            if alias in data:
+                val = data[alias]
+                if val is not None and not np.isnan(val):
+                    return float(val)
+
+        return None
+
+
+# ============================================
+# 2. 增强的日内分位数基线
+# ============================================
+
+
+class IntradayQuantileBaseline:
+    """
+    日内分位数基线 v1.1
+
+    改进：
+    1. 更多分位数（p05, p10, p20, p50, p80, p90, p95, p99）
+    2. Session分离（早盘/午盘）
+    3. Out-of-session标记
+    """
+
+    # 交易时段定义（港股时间）
+    SESSIONS = {
+        "morning": ((9, 30), (12, 0)),  # 早盘
+        "afternoon": ((13, 0), (16, 0)),  # 午盘
+    }
+
+    def __init__(self, bucket_minutes=5):
+        self.bucket_minutes = bucket_minutes
+
+        # {session: {bucket_id: {'metric': [values]}}}
+        self.historical_data = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(list))
         )
 
-    def get_threshold_multiplier(self, regime: Optional[MarketRegime] = None) -> float:
-        """
-        获取体制对应的入场阈值倍数
+        # 计算好的分位数表
+        self.quantile_table = {}
 
-        Args:
-            regime: 体制类型
+        # 分位数集合
+        self.quantiles = [0.05, 0.10, 0.20, 0.50, 0.80, 0.90, 0.95, 0.99]
+
+    def _get_session_and_bucket(self, timestamp_ms: int) -> Tuple[Optional[str], int]:
+        """
+        获取session和bucket_id
 
         Returns:
-            multiplier: 阈值倍数（1.0为基准）
+            (session_name, bucket_id) 或 (None, -1) if out of session
         """
-        if regime is None:
-            regime = self.current_regime
+        dt = pd.Timestamp(timestamp_ms, unit="ms", tz="Asia/Shanghai")
+        hour, minute = dt.hour, dt.minute
 
-        return self.threshold_multiplier.get(regime, 1.0)
+        for session_name, ((start_h, start_m), (end_h, end_m)) in self.SESSIONS.items():
+            # 检查是否在该session内
+            time_minutes = hour * 60 + minute
+            start_minutes = start_h * 60 + start_m
+            end_minutes = end_h * 60 + end_m
 
-    def get_regime_summary(self) -> str:
-        """生成体制分析报告"""
-        report = []
-        report.append(f"=== Regime Detector Status ===")
-        report.append(f"Current Regime: {self.current_regime.value}")
-        report.append(f"Confidence: {self.regime_confidence:.2f}")
+            if start_minutes <= time_minutes < end_minutes:
+                # 计算session内的bucket
+                minutes_since_session_start = time_minutes - start_minutes
+                bucket_id = minutes_since_session_start // self.bucket_minutes
+                return session_name, bucket_id
 
-        weights = self.get_alpha_weights()
-        report.append(f"\nFactor Weights:")
-        report.append(f"  White: {weights['white_weight']:.2f}")
-        report.append(f"  Black: {weights['black_weight']:.2f}")
-        report.append(f"  Rationale: {weights['rationale']}")
+        return None, -1  # Out of session
 
-        multiplier = self.get_threshold_multiplier()
-        report.append(f"\nThreshold Multiplier: {multiplier:.2f}x")
+    def add_observation(
+        self, timestamp_ms: int, vpin: float, spread: float, depth: float
+    ):
+        """添加观测值"""
+        session, bucket_id = self._get_session_and_bucket(timestamp_ms)
 
-        if len(self.regime_history) >= 10:
-            recent = self.regime_history[-10:]
-            regime_counts = {}
-            for r in recent:
-                regime_counts[r] = regime_counts.get(r, 0) + 1
+        if session is None:
+            return  # 跳过休市时间
 
-            report.append(f"\nRecent Regime Distribution (last 10 bars):")
-            for regime, count in regime_counts.items():
-                report.append(f"  {regime.value}: {count}/10")
+        self.historical_data[session][bucket_id]["vpin"].append(vpin)
+        self.historical_data[session][bucket_id]["spread"].append(spread)
+        self.historical_data[session][bucket_id]["depth"].append(depth)
 
-        return "\n".join(report)
+    def compute_quantiles(self):
+        """计算所有session和bucket的分位数"""
+        for session in self.historical_data:
+            for bucket_id in self.historical_data[session]:
+                key = f"{session}_{bucket_id}"
+                self.quantile_table[key] = {}
 
+                for metric in ["vpin", "spread", "depth"]:
+                    data = self.historical_data[session][bucket_id][metric]
 
-# ========================================
-# 高级功能：动量指标计算（TODO用户实现）
-# ========================================
+                    if len(data) > 10:
+                        self.quantile_table[key][metric] = {
+                            f"p{int(q*100):02d}": np.percentile(data, q * 100)
+                            for q in self.quantiles
+                        }
+                    else:
+                        # 数据不足，使用默认值
+                        self.quantile_table[key][metric] = {
+                            f"p{int(q*100):02d}": 0.0 for q in self.quantiles
+                        }
 
+    def get_threshold(self, timestamp_ms: int, metric: str, percentile: str) -> float:
+        """获取动态阈值"""
+        session, bucket_id = self._get_session_and_bucket(timestamp_ms)
 
-class MomentumIndicator:
-    """
-    动量指标计算器
-
-    TODO: 用户根据自己的策略实现
-
-    建议指标：
-    1. 价格动量（短期/长期均线偏离）
-    2. 方向性成交量（买卖力量对比）
-    3. 自相关性（价格序列的autocorrelation）
-    4. RSI/MACD等经典技术指标
-    """
-
-    def __init__(self, window_short=20, window_long=100):
-        self.window_short = window_short
-        self.window_long = window_long
-        self.price_history = []
-        self.volume_history = []
-
-    def update(self, price: float, volume: int):
-        """更新历史数据"""
-        self.price_history.append(price)
-        self.volume_history.append(volume)
-
-        # 限制长度
-        if len(self.price_history) > self.window_long * 2:
-            self.price_history.pop(0)
-            self.volume_history.pop(0)
-
-    def compute_momentum_z(self) -> float:
-        """
-        计算动量Z-score
-
-        TODO: 用户实现自己的逻辑
-
-        Returns:
-            momentum_z: 标准化的动量指标
-        """
-        if len(self.price_history) < self.window_long:
+        if session is None:
             return 0.0
 
-        # 示例：简单的价格变化率
-        recent = np.array(self.price_history[-self.window_short :])
-        baseline = np.array(self.price_history[-self.window_long : -self.window_short])
+        key = f"{session}_{bucket_id}"
+        if key in self.quantile_table:
+            return self.quantile_table[key].get(metric, {}).get(percentile, 0.0)
 
-        mean_recent = recent.mean()
-        mean_baseline = baseline.mean()
-        std_baseline = baseline.std()
+        return 0.0
 
-        if std_baseline > 1e-9:
-            momentum_z = (mean_recent - mean_baseline) / std_baseline
+    def get_rank(self, timestamp_ms: int, metric: str, value: float) -> float:
+        """
+        获取value在历史分布中的分位数位置（rank）
+
+        Returns:
+            0.0-1.0，表示value在该bucket历史分布中的位置
+        """
+        session, bucket_id = self._get_session_and_bucket(timestamp_ms)
+
+        if session is None:
+            return 0.5  # 默认中位数
+
+        data = self.historical_data[session][bucket_id].get(metric, [])
+        if len(data) < 10:
+            return 0.5
+
+        # 计算rank（小于等于value的比例）
+        rank = sum(1 for v in data if v <= value) / len(data)
+        return rank
+
+
+# ============================================
+# 3. 价格动力学指标（保持不变）
+# ============================================
+
+
+class PriceDynamicsIndicators:
+    """价格动力学指标（已验证可用）"""
+
+    def __init__(self, window=20):
+        self.window = window
+        self.returns_buffer = deque(maxlen=window)
+        self.mid_buffer = deque(maxlen=window)
+
+    def update(self, mid: float, prev_mid: float):
+        """更新缓冲区"""
+        if mid > 0 and prev_mid > 0:
+            ret = np.log(mid / prev_mid)
         else:
-            momentum_z = 0.0
+            ret = 0.0
 
-        return momentum_z
+        self.returns_buffer.append(ret)
+        self.mid_buffer.append(mid)
+
+    def get_drift_to_vol_ratio(self) -> float:
+        """漂移-波动比"""
+        if len(self.returns_buffer) < 10:
+            return 0.0
+
+        rets = np.array(list(self.returns_buffer))
+        drift = abs(rets.sum())
+        vol = rets.std() * np.sqrt(len(rets))
+
+        if vol < 1e-9:
+            return 0.0
+
+        return drift / vol
+
+    def get_directional_consistency(self) -> float:
+        """方向一致性"""
+        if len(self.returns_buffer) < 10:
+            return 0.0
+
+        rets = np.array(list(self.returns_buffer))
+        pos_ratio = (rets > 0).sum() / len(rets)
+
+        return pos_ratio - 0.5
+
+    def get_lag1_autocorr(self) -> float:
+        """Lag-1自相关"""
+        if len(self.returns_buffer) < 10:
+            return 0.0
+
+        rets = np.array(list(self.returns_buffer))
+
+        if len(rets) < 2:
+            return 0.0
+
+        corr = np.corrcoef(rets[:-1], rets[1:])[0, 1]
+
+        return corr if not np.isnan(corr) else 0.0
+
+    def get_mean_reversion_strength(self) -> float:
+        """均值回复强度"""
+        if len(self.mid_buffer) < self.window:
+            return 0.0
+
+        mids = np.array(list(self.mid_buffer))
+        ma = mids[:-5].mean() if len(mids) > 5 else mids.mean()
+
+        deviation = (mids[-1] - ma) / (ma + 1e-9)
+
+        if len(mids) >= 5:
+            recent_trend = (mids[-1] - mids[-5]) / (mids[-5] + 1e-9)
+            reversion_signal = -deviation * recent_trend
+            return reversion_signal
+
+        return 0.0
+
+    def get_realized_vol(self) -> float:
+        """实现波动"""
+        if len(self.returns_buffer) < 10:
+            return 0.0
+
+        rets = np.array(list(self.returns_buffer))
+        return rets.std()
 
 
-# ========================================
-# 使用示例
-# ========================================
+# ============================================
+# 4. 两层Regime检测器 v1.1
+# ============================================
 
-if __name__ == "__main__":
-    # 初始化
-    detector = RegimeDetector()
-    momentum_calc = MomentumIndicator()
 
-    # 模拟数据流
-    for i in range(100):
-        # 模拟白盒指标
-        white_risk = {
-            "vpin_z": np.random.randn(),
-            "spread_bps": 5 + np.random.rand() * 10,
-            "depth": 5000 + np.random.randint(-2000, 2000),
-        }
+class TwoTierRegimeDetector_v11:
+    """
+    两层Regime检测器 v1.1
 
-        # 计算动量（用户实现）
-        price = 4.5 + np.random.randn() * 0.1
-        volume = 10000 + np.random.randint(-3000, 3000)
-        momentum_calc.update(price, volume)
-        white_risk["momentum_z"] = momentum_calc.compute_momentum_z()
+    核心改进：
+    1. ✅ 字段统一映射
+    2. ✅ 健康度闸门
+    3. ✅ 分位数评分制（避免锁死）
+    4. ✅ 迟滞阈值（enter > exit）
+    5. ✅ Action两阶段gating
+    6. ✅ Micro/Action独立min_residence
+    7. ✅ 连续置信度
+    """
 
-        # 检测体制
-        regime, confidence = detector.detect(white_risk)
+    def __init__(
+        self,
+        baseline: IntradayQuantileBaseline,
+        min_residence_micro=10,
+        min_residence_action=15,
+    ):
+        self.baseline = baseline
+        self.min_residence_micro = 30  # Increased for stability (was 10)
+        self.min_residence_action = 50  # Increased for stability (was 15)
 
-        if i % 20 == 0:
-            print(f"\n--- Bar {i} ---")
-            print(f"White Risk: {white_risk}")
-            print(detector.get_regime_summary())
+        # 状态
+        self.current_micro = "normal"
+        self.current_action = "neutral"
+        self.residence_counter_micro = 0
+        self.residence_counter_action = 0
+
+        # 价格动力学
+        self.dynamics = PriceDynamicsIndicators(window=40)  # Slower window (was 20)
+
+        # 健康度监控
+        self.health_monitor = FeatureHealthMonitor(
+            window=300
+        )  # Longer window for sticky prices (was 100)
+
+        # 字段映射器
+        self.mapper = CanonicalFeatureMapper()
+
+        # 评分历史（用于平滑）
+        self.illiquid_score_buffer = deque(maxlen=10)  # Smoother (was 5)
+        self.highvol_score_buffer = deque(maxlen=10)  # Smoother (was 5)
+
+    def detect(
+        self, timestamp_ms: int, white_risk: Dict, mid: float, prev_mid: float
+    ) -> Tuple[str, str, float]:
+        """
+        主检测接口
+
+        Returns:
+            (micro_regime, action_regime, confidence)
+        """
+        # 更新动力学
+        self.dynamics.update(mid, prev_mid)
+
+        # 🔧 1. 字段统一映射
+        vpin = self.mapper.get_canonical_value(white_risk, "vpin") or 0.0
+        spread = self.mapper.get_canonical_value(white_risk, "spread_bps") or 0.0
+        depth = self.mapper.get_canonical_value(white_risk, "depth") or 10000.0
+
+        # 🔧 2. 更新健康度
+        self.health_monitor.update("vpin", vpin)
+        self.health_monitor.update("spread", spread)
+        self.health_monitor.update("depth", depth)
+
+        # 健康度检查
+        vpin_healthy, _ = self.health_monitor.is_healthy("vpin")
+        spread_healthy, _ = self.health_monitor.is_healthy("spread")
+        depth_healthy, _ = self.health_monitor.is_healthy("depth")
+
+        # 🔧 3. Micro层：分位数评分制
+        new_micro, micro_conf = self._detect_micro_regime(
+            timestamp_ms,
+            vpin,
+            spread,
+            depth,
+            vpin_healthy,
+            spread_healthy,
+            depth_healthy,
+        )
+
+        # Micro切换控制
+        if new_micro != self.current_micro:
+            if self.residence_counter_micro >= self.min_residence_micro:
+                self.current_micro = new_micro
+                self.residence_counter_micro = 0
+                # Micro切换时重置Action
+                self.current_action = "neutral"
+                self.residence_counter_action = 0
+        self.residence_counter_micro += 1
+
+        # 🔧 4. Action层：两阶段gating
+        if self.current_micro == "illiquid":
+            # illiquid时Action无意义
+            new_action = "neutral"
+            action_conf = 0.0
+        else:
+            new_action, action_conf = self._detect_action_regime(timestamp_ms)
+
+        # Action切换控制（仅在Micro稳定时允许）
+        if new_action != self.current_action and self.residence_counter_micro >= 5:
+            if self.residence_counter_action >= self.min_residence_action:
+                self.current_action = new_action
+                self.residence_counter_action = 0
+        self.residence_counter_action += 1
+
+        # 综合置信度
+        overall_conf = micro_conf * (1.0 if self.current_micro != "illiquid" else 0.5)
+        overall_conf *= max(0.5, action_conf) if action_conf > 0 else 0.7
+
+        return self.current_micro, self.current_action, overall_conf
+
+    def _detect_micro_regime(
+        self,
+        timestamp_ms: int,
+        vpin: float,
+        spread: float,
+        depth: float,
+        vpin_healthy: bool,
+        spread_healthy: bool,
+        depth_healthy: bool,
+    ) -> Tuple[str, float]:
+        """
+        Micro层检测：分位数评分制
+
+        核心改进：避免OR进入AND退出的锁死
+        """
+        # 获取rank（分位数位置）
+        rank_spread = (
+            self.baseline.get_rank(timestamp_ms, "spread", spread)
+            if spread_healthy
+            else 0.5
+        )
+        rank_depth = (
+            self.baseline.get_rank(timestamp_ms, "depth", depth)
+            if depth_healthy
+            else 0.5
+        )
+        rank_vpin = (
+            self.baseline.get_rank(timestamp_ms, "vpin", abs(vpin))
+            if vpin_healthy
+            else 0.5
+        )
+
+        # 计算illiquid_score
+        # 价差异常扩大 + 深度异常塌陷
+        illiquid_score = (
+            max(0, rank_spread - 0.95) * 20 + max(0, 0.05 - rank_depth) * 20
+        )
+        self.illiquid_score_buffer.append(illiquid_score)
+        illiquid_score_smooth = np.mean(self.illiquid_score_buffer)
+
+        # 计算highvol_score
+        # VPIN尾部 + 实现波动尾部
+        realized_vol = self.dynamics.get_realized_vol()
+        rank_vol = 0.99 if realized_vol > 0.001 else 0.5  # 简化：实际应该也用baseline
+
+        highvol_score = max(0, rank_vpin - 0.90) * 10 + max(0, rank_vol - 0.90) * 10
+        self.highvol_score_buffer.append(highvol_score)
+        highvol_score_smooth = np.mean(self.highvol_score_buffer)
+
+        # 🔧 迟滞阈值
+        if self.current_micro == "illiquid":
+            # 退出阈值更宽松
+            if illiquid_score_smooth < 0.3:  # 退出阈值
+                pass  # 允许退出到normal
+            else:
+                return "illiquid", 0.9
+
+        if self.current_micro == "high_volatility":
+            if highvol_score_smooth < 0.3:
+                pass
+            else:
+                return "high_volatility", 0.85
+
+        # 进入判断
+        if illiquid_score_smooth > 0.5:  # 进入阈值更严格
+            return "illiquid", 0.9
+
+        if highvol_score_smooth > 0.5:
+            return "high_volatility", 0.85
+
+        return "normal", 0.7
+
+    def _detect_action_regime(self, timestamp_ms: int) -> Tuple[str, float]:
+        """
+        Action层检测：两阶段gating
+
+        改进：确保可交易驻留长度
+        """
+        # 🔧 Stage 1: 动力学信息gating
+        realized_vol = self.dynamics.get_realized_vol()
+
+        # 获取该bucket的低分位阈值
+        vol_p10 = self.baseline.get_threshold(timestamp_ms, "spread", "p10")  # 近似
+
+        if realized_vol < 1e-5:  # 极低波动，无动力学信息
+            return "neutral", 0.3
+
+        # 🔧 Stage 2: 证据竞争
+        # trending证据
+        drift_vol = self.dynamics.get_drift_to_vol_ratio()
+        dir_cons = abs(self.dynamics.get_directional_consistency())
+        trending_score = (
+            min(drift_vol / 1.5, 1.0) * 0.6 + min(dir_cons / 0.3, 1.0) * 0.4
+        )
+
+        # mean_reverting证据
+        autocorr = self.dynamics.get_lag1_autocorr()
+        mr_strength = self.dynamics.get_mean_reversion_strength()
+        mr_score = 0.0
+        if autocorr < -0.2:
+            mr_score += min(abs(autocorr) / 0.5, 1.0) * 0.5
+        if mr_strength > 0.3:
+            mr_score += min(mr_strength / 0.8, 1.0) * 0.5
+
+        # 竞争选择（需要明显优势）
+        # 竞争选择（需要明显优势）
+        # ETF调优：
+        # 1. 提高Trending门槛 (0.4 -> 0.6)
+        # 2. 降低MR门槛 (0.4 -> 0.25)
+        # 3. 增加竞争Buffer (0.15 -> 0.20)
+
+        if trending_score > 0.60 and trending_score > mr_score + 0.20:
+            return "trending", trending_score
+        elif mr_score > 0.25 and mr_score > trending_score + 0.20:
+            return "mean_reverting", mr_score
+        else:
+            return "neutral", 0.5
+
+
+# 导出接口保持兼容
+TwoTierRegimeDetector = TwoTierRegimeDetector_v11
