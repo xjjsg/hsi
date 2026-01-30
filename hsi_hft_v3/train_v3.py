@@ -141,133 +141,148 @@ def train():
 
     # 2. Load Data
     loader = V5DataLoader(DATA_DIR)
-    # Load a range for training
-    print("[Train] Loading Training Data (Nov-Dec 2025)...")
-    data_dict = loader.load_date_range(end_date="2025-12-05")
+    # Load ALL available data (Dynamic Splitting)
+    print("[Train] Loading ALL available data...")
+    data_dict = loader.load_date_range()
 
     if not data_dict:
         print("❌ No data loaded.")
         return
 
-    # 3. Feature & Label Gen
-    print("[Train] Generating Features & Labels...")
-    wb_factory = WhiteBoxFeatureFactory()
-
-    all_white = []
-    all_tgt = []
-    all_aux = []
-    all_mask = []
-    all_y_hit = []
-    all_y_haz = []
-    all_y_risk = []
-
-    total_samples = 0
-
-    for date, samples in data_dict.items():
-        print(f"  -> Processing {date} ({len(samples)} bars)...")
-
-        # A. Features (Snapshot)
-        feats_white = []
-        raw_tgt = []
-        raw_aux = []
-        masks = []
-
-        for s in samples:
-            # Whitebox
-            wb_out = wb_factory.compute(s)
-            # FIX: Ensure deterministic key order using factory helper
-            sorted_keys = wb_factory.get_derived_keys()
-            z_feats = []
-            for k in sorted_keys:
-                z_feats.append(wb_out["white_derived"].get(k, 0.0))
-
-            # Additional check:
-            # If length varies across samples, we still crash.
-            # But sorting keys helps if keys are consistent.
-            # If keys are INCONSISTENT (e.g. some bars have extra keys), we crash.
-            # WhiteBox *should* be consistent now with the fix.
-
-            # If empty (first bars), pad
-            if not z_feats:
-                z_feats = [0.0] * 10  # approximate
-
-            feats_white.append(z_feats)
-
-            # Raw for Mamba (Normalize simple)
-            t_vec = [
-                s.target.mid / 1000.0,
-                s.target.vwap / 1000.0 if s.target.vwap else 0,
-                np.log1p(s.target.volume),
-            ]
-            a_vec = [
-                s.aux.mid / 1000.0 if s.aux else 0,
-                s.aux.vwap / 1000.0 if s.aux else 0,
-                np.log1p(s.aux.volume) if s.aux else 0,
-            ]
-
-            raw_tgt.append(t_vec)
-            raw_aux.append(a_vec)
-            masks.append(1.0 if s.aux_available else 0.0)
-
-        # B. Labels
-        y_hit, y_haz, y_risk = generate_labels(samples, lookahead=K_BARS)
-
-        # C. Sliding Window Construction
-        # We need sequences of length LOOKBACK
-        # And labels correspond to the last step? Yes.
-
-        L = len(samples)
-        if L <= LOOKBACK:
-            continue
-
-        # Convert to numpy for faster slicing
-        np_white = np.array(feats_white, dtype=np.float32)
-        np_tgt = np.array(raw_tgt, dtype=np.float32)
-        np_aux = np.array(raw_aux, dtype=np.float32)
-        np_mask = np.array(masks, dtype=np.float32)
-
-        # Minimal Sliding Window (can be optimized with stride_tricks)
-        for i in range(LOOKBACK, L):
-            # Input: Window [i-LOOKBACK : i]
-            all_tgt.append(np_tgt[i - LOOKBACK : i])
-            all_aux.append(np_aux[i - LOOKBACK : i])
-            all_mask.append(np_mask[i - LOOKBACK : i])
-            all_white.append(np_white[i - 1])  # Use last step white features
-
-            # Target: Label at i-1 (Action taken at end of bar i-1 / start of i)
-            # Actually, features up to T, prediction for T+future.
-            all_y_hit.append(y_hit[i - 1])
-            all_y_haz.append(y_haz[i - 1])
-            all_y_risk.append(y_risk[i - 1])
-
-            total_samples += 1
-
-    print(f"[Train] Constructed {total_samples} samples.")
-    if total_samples == 0:
+    # 3. Dynamic Data Splitting (80/10/10)
+    all_dates = sorted(list(data_dict.keys()))
+    n_days = len(all_dates)
+    if n_days < 3:
+        print("❌ Not enough days for splitting.")
         return
 
-    # 4. Tensors
-    t_white = torch.tensor(np.array(all_white), dtype=torch.float32).to(DEVICE)
-    t_tgt = torch.tensor(np.array(all_tgt), dtype=torch.float32).to(DEVICE)
-    t_aux = torch.tensor(np.array(all_aux), dtype=torch.float32).to(DEVICE)
-    t_mask = (
-        torch.tensor(np.array(all_mask), dtype=torch.float32).unsqueeze(-1).to(DEVICE)
-    )
+    n_train = int(0.8 * n_days)
+    n_val = int(0.1 * n_days)
+    # n_test = remainder
 
-    t_y_hit = (
-        torch.tensor(np.array(all_y_hit), dtype=torch.float32).unsqueeze(-1).to(DEVICE)
-    )
-    t_y_haz = torch.tensor(np.array(all_y_haz), dtype=torch.long).to(DEVICE)
-    t_y_risk = (
-        torch.tensor(np.array(all_y_risk), dtype=torch.float32).unsqueeze(-1).to(DEVICE)
-    )
+    train_dates = all_dates[:n_train]
+    val_dates = all_dates[n_train : n_train + n_val]
+    test_dates = all_dates[n_train + n_val :]
 
-    dataset = TensorDataset(t_white, t_tgt, t_aux, t_mask, t_y_hit, t_y_haz, t_y_risk)
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    print(
+        f"[Split] Train: {len(train_dates)} days ({train_dates[0]} ~ {train_dates[-1]})"
+    )
+    print(f"[Split] Val:   {len(val_dates)} days ({val_dates[0]} ~ {val_dates[-1]})")
+    if test_dates:
+        print(
+            f"[Split] Test:  {len(test_dates)} days ({test_dates[0]} ~ {test_dates[-1]})"
+        )
+    else:
+        print(f"[Split] Test:  0 days (insufficient data)")
+
+    # Helper to construct tensors from date list
+    def build_tensors(dates_list, data_map):
+        b_white, b_tgt, b_aux, b_mask = [], [], [], []
+        b_y_hit, b_y_haz, b_y_risk = [], [], []
+
+        count = 0
+        wb_factory_local = WhiteBoxFeatureFactory()
+
+        for date in dates_list:
+            if date not in data_map:
+                continue
+            samples = data_map[date]
+
+            # --- Per Date Processing (Same as before) ---
+            feats_white = []
+            raw_tgt = []
+            raw_aux = []
+            masks = []
+
+            for s in samples:
+                wb_out = wb_factory_local.compute(s)
+                sorted_keys = wb_factory_local.get_derived_keys()
+                z_feats = []
+                for k in sorted_keys:
+                    z_feats.append(wb_out["white_derived"].get(k, 0.0))
+                if not z_feats:
+                    z_feats = [0.0] * 10
+                feats_white.append(z_feats)
+
+                t_vec = [
+                    s.target.mid / 1000.0,
+                    s.target.vwap / 1000.0 if s.target.vwap else 0,
+                    np.log1p(s.target.volume),
+                ]
+                a_vec = [
+                    s.aux.mid / 1000.0 if s.aux else 0,
+                    s.aux.vwap / 1000.0 if s.aux else 0,
+                    np.log1p(s.aux.volume) if s.aux else 0,
+                ]
+
+                raw_tgt.append(t_vec)
+                raw_aux.append(a_vec)
+                masks.append(1.0 if s.aux_available else 0.0)
+
+            # Labels
+            y_hit, y_haz, y_risk = generate_labels(samples, lookahead=K_BARS)
+
+            # Sliding Window
+            L = len(samples)
+            if L <= LOOKBACK:
+                continue
+
+            np_white = np.array(feats_white, dtype=np.float32)
+            np_tgt = np.array(raw_tgt, dtype=np.float32)
+            np_aux = np.array(raw_aux, dtype=np.float32)
+            np_mask = np.array(masks, dtype=np.float32)
+
+            for i in range(LOOKBACK, L):
+                b_tgt.append(np_tgt[i - LOOKBACK : i])
+                b_aux.append(np_aux[i - LOOKBACK : i])
+                b_mask.append(np_mask[i - LOOKBACK : i])
+                b_white.append(np_white[i - 1])
+                b_y_hit.append(y_hit[i - 1])
+                b_y_haz.append(y_haz[i - 1])
+                b_y_risk.append(y_risk[i - 1])
+                count += 1
+
+        if count == 0:
+            return None
+
+        return (
+            torch.tensor(np.array(b_white), dtype=torch.float32).to(DEVICE),
+            torch.tensor(np.array(b_tgt), dtype=torch.float32).to(DEVICE),
+            torch.tensor(np.array(b_aux), dtype=torch.float32).to(DEVICE),
+            torch.tensor(np.array(b_mask), dtype=torch.float32)
+            .unsqueeze(-1)
+            .to(DEVICE),
+            torch.tensor(np.array(b_y_hit), dtype=torch.float32)
+            .unsqueeze(-1)
+            .to(DEVICE),
+            torch.tensor(np.array(b_y_haz), dtype=torch.long).to(DEVICE),
+            torch.tensor(np.array(b_y_risk), dtype=torch.float32)
+            .unsqueeze(-1)
+            .to(DEVICE),
+        )
+
+    # 4. Construct DataLoaders
+    print("[Train] Building TRAIN tensors...")
+    train_tensors = build_tensors(train_dates, data_dict)
+    if not train_tensors:
+        print("❌ Train set empty.")
+        return
+    train_ds = TensorDataset(*train_tensors)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+
+    print("[Train] Building VAL tensors...")
+    val_tensors = build_tensors(val_dates, data_dict)
+    val_loader = None
+    if val_tensors:
+        val_ds = TensorDataset(*val_tensors)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+        print(f"  -> Val Samples: {len(val_ds)}")
+    else:
+        print("⚠️ Val set empty, skipping validation.")
 
     # 5. Model Setup
-    dim_raw = t_tgt.shape[-1]
-    dim_white = t_white.shape[-1]
+    dim_raw = train_tensors[1].shape[-1]
+    dim_white = train_tensors[0].shape[-1]
 
     miner = DeepFactorMinerV5(input_dim_raw=dim_raw, out_dim=BLACKBOX_DIM).to(DEVICE)
 
@@ -391,10 +406,47 @@ def train():
             optimizer.step()
 
             total_loss += loss.item()
-                steps += 1
+            steps += 1
 
         avg_loss = total_loss / steps
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_loss:.4f}")
+
+        # Validation Step
+        if val_loader:
+            miner.eval()
+            combine.eval()
+            val_loss_sum = 0
+            val_steps = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    b_w, b_t, b_a, b_m, y_h, y_z, y_r = batch
+                    deep_factors = miner(b_t, b_a, b_m)
+                    out = combine(b_w, deep_factors)
+
+                    l_hit = crit_hit(out["logit_hit"], y_h)
+                    l_risk = crit_risk(out["logit_risk"], y_r)
+
+                    # Hazard Logic (copy of train)
+                    B, K = out["logit_hazard"].shape
+                    haz_targets = torch.zeros_like(out["logit_hazard"])
+                    haz_mask = torch.zeros_like(out["logit_hazard"])
+                    for i in range(B):
+                        idx = int(y_z[i].item())
+                        haz_mask[i, : idx + 1] = 1.0
+                        if y_h[i].item() > 0.5:
+                            haz_targets[i, idx] = 1.0
+
+                    l_haz_elem = crit_haz(out["logit_hazard"], haz_targets)
+                    l_haz = (l_haz_elem * haz_mask).sum() / (haz_mask.sum() + 1e-6)
+
+                    val_loss_sum += (l_hit + 0.5 * l_haz + 0.5 * l_risk).item()
+                    val_steps += 1
+
+            print(
+                f"Epoch {epoch+1}/{EPOCHS} | Val Loss:   {val_loss_sum/val_steps:.4f}"
+            )
+            miner.train()
+            combine.train()
 
     # 7. Save Model
     os.makedirs("./checkpoints", exist_ok=True)
@@ -408,11 +460,10 @@ def train():
     if COMPUTE_BASELINE_STATS:
         print("\n[PostTrain] Computing baseline_stats for RiskMonitor...")
 
-        # 准备DataLoader用于baseline计算
-        # 使用训练集的一个子集即可
-        subset_size = min(1000, len(dataset))
-        subset_indices = torch.randperm(len(dataset))[:subset_size]
-        subset_dataset = torch.utils.data.Subset(dataset, subset_indices)
+        # Prepare DataLoader for baseline calculation -> Use Train Subset
+        subset_size = min(1000, len(train_ds))
+        subset_indices = torch.randperm(len(train_ds))[:subset_size]
+        subset_dataset = torch.utils.data.Subset(train_ds, subset_indices)
         baseline_loader = DataLoader(subset_dataset, batch_size=128, shuffle=False)
 
         # 定义临时模型包装（用于compute_baseline_stats）
@@ -432,12 +483,12 @@ def train():
 
         # 计算统计量
         baseline_stats = {
-            'black_mu': 0.0,
-            'black_sigma': 0.0,
-            'black_q99': 0.0,
-            'black_samples': [],
-            'white_mu': 0.0,
-            'white_sigma': 0.0
+            "black_mu": 0.0,
+            "black_sigma": 0.0,
+            "black_q99": 0.0,
+            "black_samples": [],
+            "white_mu": 0.0,
+            "white_sigma": 0.0,
         }
 
         black_outputs = []
@@ -450,27 +501,31 @@ def train():
                 deep_factors = miner(b_t, b_a, b_m)
                 output = combine(b_w, deep_factors)
 
-                black_outputs.extend(output['delta_hit'].cpu().numpy().flatten())
-                white_outputs.extend(output['base_hit'].cpu().numpy().flatten())
+                black_outputs.extend(output["delta_hit"].cpu().numpy().flatten())
+                white_outputs.extend(output["base_hit"].cpu().numpy().flatten())
 
         black_outputs = np.array(black_outputs)
         white_outputs = np.array(white_outputs)
 
-        baseline_stats['black_mu'] = float(black_outputs.mean())
-        baseline_stats['black_sigma'] = float(black_outputs.std())
-        baseline_stats['black_q99'] = float(np.percentile(np.abs(black_outputs), 99))
-        baseline_stats['black_samples'] = black_outputs[:1000].tolist()
-        baseline_stats['white_mu'] = float(white_outputs.mean())
-        baseline_stats['white_sigma'] = float(white_outputs.std())
+        baseline_stats["black_mu"] = float(black_outputs.mean())
+        baseline_stats["black_sigma"] = float(black_outputs.std())
+        baseline_stats["black_q99"] = float(np.percentile(np.abs(black_outputs), 99))
+        baseline_stats["black_samples"] = black_outputs[:1000].tolist()
+        baseline_stats["white_mu"] = float(white_outputs.mean())
+        baseline_stats["white_sigma"] = float(white_outputs.std())
 
         # 保存baseline_stats
         BASELINE_PATH = "./checkpoints/baseline_stats.pkl"
-        with open(BASELINE_PATH, 'wb') as f:
+        with open(BASELINE_PATH, "wb") as f:
             pickle.dump(baseline_stats, f)
 
         print(f"✅ Baseline stats saved to {BASELINE_PATH}")
-        print(f"   Black μ={baseline_stats['black_mu']:.4f}, σ={baseline_stats['black_sigma']:.4f}")
-        print(f"   White μ={baseline_stats['white_mu']:.4f}, σ={baseline_stats['white_sigma']:.4f}")
+        print(
+            f"   Black μ={baseline_stats['black_mu']:.4f}, σ={baseline_stats['black_sigma']:.4f}"
+        )
+        print(
+            f"   White μ={baseline_stats['white_mu']:.4f}, σ={baseline_stats['white_sigma']:.4f}"
+        )
 
 
 if __name__ == "__main__":
