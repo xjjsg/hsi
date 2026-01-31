@@ -108,7 +108,7 @@ class PolicyConfig:
     cooldown_bars: int = 20  # 交易冷却期 (Bar数, 20*3=1分钟)
 
     # 微观结构与白盒门槛
-    spread_max_bps: float = 5.0  # 最大允许盘口价差 (严格控制)
+    spread_max_bps: float = 15.0  # 最大允许盘口价差 (放宽至约2.5个Tick, 1Tick~6.2bps)
     depth_min_qty: int = 5000  # 盘口最小挂单量 (流动性过滤)
     vpin_max_z: float = 3.0  # VPIN (毒性流) 入场阈值 (Z-score)
     vpin_exit_z: float = 3.5  # VPIN 强制离场阈值

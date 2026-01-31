@@ -186,17 +186,11 @@ class RiskMonitor:
         recent_preds = np.array(list(self.predictions)[-10:])
 
         # 1. IC (Information Coefficient)
-        if len(recent_preds) == len(recent_returns):
-            ic = np.corrcoef(recent_preds, recent_returns)[0, 1]
-            if not np.isnan(ic) and ic < self.config["ic_threshold"]:
-                self._trigger_alert(
-                    "ic_negative",
-                    {
-                        "severity": "critical",
-                        "ic": ic,
-                        "sample_size": len(recent_returns),
-                    },
-                )
+        # DISABLE: Currently broken due to alignment mismatch between realized_returns (trades) and predictions (bars)
+        # if len(recent_preds) == len(recent_returns):
+        #     ic = np.corrcoef(recent_preds, recent_returns)[0, 1]
+        #     if not np.isnan(ic) and ic < self.config["ic_threshold"]:
+        #         self._trigger_alert(...)
 
         # 2. 累积PnL（黑盒）
         if self.black_pnl < self.config["black_loss_threshold"]:

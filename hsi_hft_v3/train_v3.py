@@ -857,6 +857,20 @@ def run_backtest(miner, combine, val_dates, data_map, device):
     # Calculate Metrics
     metrics = calculate_metrics(engine.trades, engine.equity_curve)
 
+    # 5. 生成详细报告 (NEW)
+    os.makedirs("./reports", exist_ok=True)
+    df_daily = engine.generate_report("./reports")
+
+    if not df_daily.empty:
+        print("\n=== 每日交易统计 (Daily Statistics) ===")
+        # 使用 to_markdown 如果 pandas 版本支持，否则 print
+        try:
+            print(df_daily.to_markdown(index=False))
+        except:
+            print(df_daily)
+    else:
+        print("\n⚠️ 本次验证无交易产生。")
+
     # Add Debug Stats
     if all_p_hits:
         metrics["avg_p_hit"] = np.mean(all_p_hits)
@@ -1217,7 +1231,7 @@ def train():
             if epoch >= 5:
                 bk_metrics = run_backtest(miner, combine, val_dates, data_dict, DEVICE)
                 print(
-                    f"[Backtest] PnL: {bk_metrics['total_pnl']:.2f} | Sharpe: {bk_metrics['sharpe']:.2f} | Trades: {bk_metrics['n_trades']} | Win: {bk_metrics['fill_rate_pct']:.1f}%"
+                    f"[Backtest] PnL: {bk_metrics['total_pnl']:.2f} | Sharpe: {bk_metrics['sharpe']:.2f} | Trades: {bk_metrics['n_trades']} | Fill: {bk_metrics['fill_rate_pct']:.1f}%"
                 )
                 if "avg_p_hit" in bk_metrics:
                     print(
@@ -1225,12 +1239,18 @@ def train():
                     )
 
             # Save Checkpoint
-            if (epoch + 1) % 5 == 0:
+            # Save Checkpoint
+            if (epoch + 1) % 1 == 0:
                 os.makedirs("./checkpoints", exist_ok=True)
                 checkpoint_path = f"./checkpoints/v3_model_epoch_{epoch+1}.pth"
                 torch.save(
                     {"miner": miner.state_dict(), "combine": combine.state_dict()},
                     checkpoint_path,
+                )
+                # Also save 'latest' every epoch
+                torch.save(
+                    {"miner": miner.state_dict(), "combine": combine.state_dict()},
+                    "./checkpoints/v3_model_latest.pth",
                 )
                 print(f"✅ Checkpoint saved to {checkpoint_path}")
 

@@ -16,11 +16,13 @@ HSI HFT V3 - Trading Layer (Consolidated Module)
 4. 性能指标：PnL、夏普、回撤等评估指标
 """
 
+import os
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Dict, Tuple, Deque
+from typing import List, Tuple, Dict, Optional, Deque
+import datetime
 from collections import deque
 
 # 导入数据层的依赖（需要 AlignedSample）
@@ -234,11 +236,21 @@ class StateMachine:
 class Order:
     """Order representation"""
 
-    def __init__(self, action: str, create_time: int, trade_time: int, qty: int):
+    def __init__(
+        self,
+        action: str,
+        create_time: int,
+        trade_time: int,
+        qty: int,
+        reason: str = "",
+        probs: Dict = None,
+    ):
         self.action = action
         self.create_time = create_time
         self.trade_time = trade_time
         self.qty = qty
+        self.reason = reason
+        self.probs = probs or {}
         self.is_filled = False
 
 
@@ -264,7 +276,7 @@ class BacktestEngine:
 
         # NEW: RiskMonitor集成
         if baseline_stats:
-            from hsi_hft_v3.risk_monitor import RiskMonitor
+            from hsi_hft_v3.model.risk_monitor import RiskMonitor
 
             self.risk_monitor = RiskMonitor(baseline_stats, window_size=60)
             print("✅ RiskMonitor initialized with baseline stats")
@@ -339,13 +351,27 @@ class BacktestEngine:
             # 3. 生成订单 (延迟)
             if pol_out.action == Action.ENTER_LONG:
                 trade_ts = sample.ts_ms + (LATENCY_BARS * 3000)
-                order = Order("BUY", sample.ts_ms, trade_ts, TRADE_QTY)
+                order = Order(
+                    "BUY",
+                    sample.ts_ms,
+                    trade_ts,
+                    TRADE_QTY,
+                    reason=pol_out.reason,
+                    probs=model_out,
+                )
                 self.latency_queue.append(order)
                 self.policy.on_order_sent(Action.ENTER_LONG)
 
             elif pol_out.action == Action.EXIT_LONG:
                 trade_ts = sample.ts_ms + (LATENCY_BARS * 3000)
-                order = Order("SELL", sample.ts_ms, trade_ts, TRADE_QTY)
+                order = Order(
+                    "SELL",
+                    sample.ts_ms,
+                    trade_ts,
+                    TRADE_QTY,
+                    reason=pol_out.reason,
+                    probs=model_out,
+                )
                 self.latency_queue.append(order)
                 self.policy.on_order_sent(Action.EXIT_LONG)
 
@@ -386,10 +412,26 @@ class BacktestEngine:
                     cost = order.qty * ask_px * (1 + COST_RATE)
                     self.cash -= cost
                     self.position += order.qty
-                    self._log_trade(sample.ts_ms, "BUY", ask_px, order.qty, cost)
+                    self._log_trade(
+                        sample.ts_ms,
+                        "BUY",
+                        ask_px,
+                        order.qty,
+                        cost,
+                        order.reason,
+                        order.probs,
+                    )
                     self.policy.on_fill(Action.ENTER_LONG)
                 else:
-                    self._log_trade(sample.ts_ms, "SKIP_BUY", ask_px, 0, 0)
+                    self._log_trade(
+                        sample.ts_ms,
+                        "SKIP_BUY",
+                        ask_px,
+                        0,
+                        0,
+                        order.reason,
+                        order.probs,
+                    )
                     self.policy.on_reject(Action.ENTER_LONG)
 
         elif order.action == "SELL":
@@ -402,15 +444,140 @@ class BacktestEngine:
                     revenue = order.qty * bid_px * (1 - COST_RATE)
                     self.cash += revenue
                     self.position -= order.qty
-                    self._log_trade(sample.ts_ms, "SELL", bid_px, order.qty, revenue)
+                    self._log_trade(
+                        sample.ts_ms,
+                        "SELL",
+                        bid_px,
+                        order.qty,
+                        revenue,
+                        order.reason,
+                        order.probs,
+                    )
                     self.policy.on_fill(Action.EXIT_LONG)
                 else:
-                    self._log_trade(sample.ts_ms, "SKIP_SELL", bid_px, 0, 0)
+                    self._log_trade(
+                        sample.ts_ms,
+                        "SKIP_SELL",
+                        bid_px,
+                        0,
+                        0,
+                        order.reason,
+                        order.probs,
+                    )
                     self.policy.on_reject(Action.EXIT_LONG)
 
-    def _log_trade(self, ts, side, px, qty, amt):
+    def _log_trade(
+        self,
+        ts,
+        side,
+        px,
+        qty,
+        amt,
+        reason: str = "",
+        probs: Dict = None,
+    ):
         """Log trade execution"""
-        self.trades.append({"ts": ts, "side": side, "px": px, "qty": qty, "amt": amt})
+                "p_risk": probs.get("risk", 0.0) if probs else 0.0,
+            }
+        )
+
+    def generate_report(self, output_dir: str = ".") -> pd.DataFrame:
+        """
+        生成详细的交易报告 (中文)
+        1. 写入 trade_log_detail.txt
+        2. 返回每日统计 DataFrame
+        """
+        if not self.trades:
+            print("⚠️ 无交易记录，无法生成报告。")
+            return pd.DataFrame()
+
+        # 1. 写入详细日志
+        log_path = os.path.join(output_dir, "trade_log_detail.txt")
+        count = 0
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("时间戳, 动作, 价格, 数量, 触发原因, P(Hit), P(Risk)\n")
+            for t in self.trades:
+                ts_sec = t["ts"] // 1000
+                dt_str = datetime.datetime.fromtimestamp(ts_sec).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                line = (
+                    f"{dt_str}, "
+                    f"{t['side']}, "
+                    f"{t['px']:.2f}, "
+                    f"{t['qty']}, "
+                    f"{t.get('reason', 'N/A')}, "
+                    f"Hit:{t.get('p_hit',0):.2f}, "
+                    f"Risk:{t.get('p_risk',0):.2f}"
+                )
+                f.write(line + "\n")
+                count += 1
+        print(f"✅ 详细交易日志已写入: {log_path} ({count} 条)")
+
+        # 2. 生成每日统计
+        df_tx = pd.DataFrame(self.trades)
+        # 转换时间戳为日期
+        df_tx["date"] = pd.to_datetime(df_tx["ts"], unit="ms").dt.date
+        
+        # 简单统计 PnL (需结合 equity curve 或近似计算)
+        # 这里用近似计算: Buy cost, Sell revenue
+        # 注意: 这种逐笔计算对于持仓过夜不准，但在这种Intraday回测中尚可
+        # 更准确的是按日切分 equity curve
+        
+        daily_stats = []
+        unique_dates = sorted(df_tx["date"].unique())
+        
+        # 需要 equity curve 来准确计算 PnL
+        df_eq = pd.DataFrame(self.equity_curve)
+        df_eq["date"] = pd.to_datetime(df_eq["ts"], unit="ms").dt.date
+        
+        initial_cap = 1_000_000.0
+        
+        for d in unique_dates:
+            day_tx = df_tx[df_tx["date"] == d]
+            day_eq = df_eq[df_eq["date"] == d]
+            
+            if day_eq.empty:
+                day_pnl = 0.0
+            else:
+                # 当日盈亏 = 结束权益 - (前一日权益 or 初始权益)
+                # 简单起见，用 当日最后权益 - 当日最初权益 (忽略过夜跳空，因为是日内策略)
+                # 或者：当日 PnL = realized PnL of trades on that day
+                
+                # 计算成交统计
+                n_buys = len(day_tx[day_tx["side"] == "BUY"])
+                n_sells = len(day_tx[day_tx["side"] == "SELL"])
+                n_tx = n_buys + n_sells
+                
+                # 计算成交率
+                # 需包含 SKIP
+                # 但 self.trades 里所有 SKIP 也带 date
+                day_skips = len(day_tx[day_tx["side"].str.startswith("SKIP")])
+                day_fills = len(day_tx[~day_tx["side"].str.startswith("SKIP")])
+                
+                fill_rate = day_fills / (day_fills + day_skips) if (day_fills + day_skips) > 0 else 0.0
+                
+                # PnL 近似: Sum(Sell Amt) - Sum(Buy Amt)
+                # 仅对闭环交易有效。如有持仓需 Mark-to-Market。
+                # 使用 Equity Curve 差值更准
+                start_eq = day_eq.iloc[0]["equity"]
+                end_eq = day_eq.iloc[-1]["equity"]
+                day_pnl = end_eq - start_eq
+                
+                # 估算成本 (Trade Vol * Price * Rate)
+                # day_tx 包含 SKIP，需过滤
+                day_filled_tx = day_tx[~day_tx["side"].str.startswith("SKIP")]
+                est_cost = (day_filled_tx["px"] * day_filled_tx["qty"] * COST_RATE).sum()
+
+                daily_stats.append({
+                    "日期": str(d),
+                    "交易次数": day_fills,
+                    "成交率": f"{fill_rate*100:.1f}%",
+                    "净收益": f"{day_pnl:.2f}",
+                    "估算成本": f"{est_cost:.2f}"
+                })
+                
+        return pd.DataFrame(daily_stats)
 
 
 # ==========================================

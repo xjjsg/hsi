@@ -1,7 +1,7 @@
 import numpy as np
 from typing import Dict, List, Optional, Deque, Tuple
 from collections import deque
-from hsi_hft_v3.data_layer import Bar, AlignedSample, BAR_SIZE_S
+from hsi_hft_v3.model.data_layer import Bar, AlignedSample, BAR_SIZE_S
 
 EPS = 1e-9
 
