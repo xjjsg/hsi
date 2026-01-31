@@ -340,21 +340,61 @@ class RiskMonitor:
         return max(0.0, min(1.0, adjusted))
 
     def get_status_report(self) -> str:
-        """生成状态报告"""
+        """生成状态报告 (中文优化版)"""
         report = []
-        report.append(f"=== Risk Monitor Status ===")
-        report.append(f"Window: {len(self.black_outputs)}/{self.window_size}")
-        report.append(f"Black PnL: {self.black_pnl:.2f} ({self.total_trades} trades)")
-        report.append(f"White PnL: {self.white_pnl:.2f}")
-        report.append(f"Alpha Adjustment: {self.alpha_adjustment:.2f}")
+        report.append(f"=== 风控监视器状态 (Risk Monitor Status) ===")
+        report.append(f"窗口: {len(self.black_outputs)}/{self.window_size}")
         report.append(
-            f"Circuit Breaker: {'🔴 ACTIVE' if self.circuit_breaker_active else '✅ OFF'}"
+            f"黑盒盈亏 (Black PnL): {self.black_pnl:.2f} ({self.total_trades} 笔交易)"
         )
-        report.append(f"\nActive Alerts ({len(self.alerts)}):")
-        for alert_type, alert in self.alerts.items():
-            severity = alert["meta"].get("severity", "info")
-            emoji = "🔴" if severity == "critical" else "🟡"
-            report.append(f"  {emoji} {alert_type}: {alert['meta']}")
+        report.append(f"白盒盈亏 (White PnL): {self.white_pnl:.2f}")
+        report.append(f"Alpha调整 (Alpha Adj): {self.alpha_adjustment:.2f}")
+        report.append(
+            f"熔断状态 (Circuit Breaker): {'🔴 已激活 (ACTIVE)' if self.circuit_breaker_active else '✅ 正常 (OFF)'}"
+        )
+
+        if self.alerts:
+            report.append(f"\n活跃警报 ({len(self.alerts)}):")
+            for alert_type, alert in self.alerts.items():
+                severity = alert["meta"].get("severity", "info")
+                emoji = "🔴" if severity == "critical" else "🟡"
+
+                # 格式化 alert_type 为中文
+                type_map = {
+                    "sharpe_negative": "夏普比率过低 (Negative Sharpe)",
+                    "drift_mean": "均值漂移 (Mean Drift)",
+                    "drift_distribution": "分布漂移 (Dist Drift)",
+                    "black_loss": "黑盒累计亏损 (Black Box Loss)",
+                    "anomaly_jump": "输出跳变 (Output Jump)",
+                    "anomaly_extreme": "极端值 (Extreme Value)",
+                }
+                cn_type = type_map.get(alert_type, alert_type)
+
+                # 格式化 meta 为可读字符串
+                meta_str = ""
+                meta = alert["meta"]
+                if alert_type == "drift_mean":
+                    meta_str = f"偏移量(Z): {meta.get('z_shift', 0):.2f}, 当前均值: {meta.get('mu_recent', 0):.2f}, 基准均值: {meta.get('mu_baseline', 0):.2f}"
+                elif alert_type == "sharpe_negative":
+                    meta_str = f"夏普: {meta.get('sharpe', 0):.2f}, 平均回报: {meta.get('mean_return', 0):.4f}"
+                else:
+                    # 其他类型简单处理
+                    meta_str = ", ".join(
+                        [
+                            (
+                                f"{k}: {v:.2f}"
+                                if isinstance(v, (float, np.float32, np.float64))
+                                else f"{k}: {v}"
+                            )
+                            for k, v in meta.items()
+                            if k != "severity"
+                        ]
+                    )
+
+                report.append(f"  {emoji} {cn_type}: {meta_str}")
+        else:
+            report.append("\n活跃警报: 无")
+
         return "\n".join(report)
 
     def reset_circuit_breaker(self):

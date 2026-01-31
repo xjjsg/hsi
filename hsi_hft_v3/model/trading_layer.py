@@ -330,7 +330,10 @@ class BacktestEngine:
 
                 # 每50个bar打印风控状态
                 if i % 50 == 0 and len(self.risk_monitor.alerts) > 0:
-                    print(f"\n[Bar {i}] {self.risk_monitor.get_status_report()}")
+                    with open("risk_monitor_log.txt", "a", encoding="utf-8") as f:
+                        f.write(
+                            f"\n[Bar {i}] {self.risk_monitor.get_status_report()}\n"
+                        )
 
             # 1. 撮合订单 (时间 >= trade_time)
             self._match_orders(sample)
@@ -477,6 +480,15 @@ class BacktestEngine:
         probs: Dict = None,
     ):
         """Log trade execution"""
+        self.trades.append(
+            {
+                "ts": ts,
+                "side": side,
+                "px": px,
+                "qty": qty,
+                "amt": amt,
+                "reason": reason,
+                "p_hit": probs.get("p_hit", 0.0) if probs else 0.0,
                 "p_risk": probs.get("risk", 0.0) if probs else 0.0,
             }
         )
@@ -518,65 +530,73 @@ class BacktestEngine:
         df_tx = pd.DataFrame(self.trades)
         # 转换时间戳为日期
         df_tx["date"] = pd.to_datetime(df_tx["ts"], unit="ms").dt.date
-        
+
         # 简单统计 PnL (需结合 equity curve 或近似计算)
         # 这里用近似计算: Buy cost, Sell revenue
         # 注意: 这种逐笔计算对于持仓过夜不准，但在这种Intraday回测中尚可
         # 更准确的是按日切分 equity curve
-        
+
         daily_stats = []
         unique_dates = sorted(df_tx["date"].unique())
-        
+
         # 需要 equity curve 来准确计算 PnL
         df_eq = pd.DataFrame(self.equity_curve)
         df_eq["date"] = pd.to_datetime(df_eq["ts"], unit="ms").dt.date
-        
+
         initial_cap = 1_000_000.0
-        
+
         for d in unique_dates:
             day_tx = df_tx[df_tx["date"] == d]
             day_eq = df_eq[df_eq["date"] == d]
-            
+
             if day_eq.empty:
                 day_pnl = 0.0
             else:
                 # 当日盈亏 = 结束权益 - (前一日权益 or 初始权益)
                 # 简单起见，用 当日最后权益 - 当日最初权益 (忽略过夜跳空，因为是日内策略)
                 # 或者：当日 PnL = realized PnL of trades on that day
-                
+
                 # 计算成交统计
                 n_buys = len(day_tx[day_tx["side"] == "BUY"])
                 n_sells = len(day_tx[day_tx["side"] == "SELL"])
                 n_tx = n_buys + n_sells
-                
+
                 # 计算成交率
                 # 需包含 SKIP
                 # 但 self.trades 里所有 SKIP 也带 date
                 day_skips = len(day_tx[day_tx["side"].str.startswith("SKIP")])
                 day_fills = len(day_tx[~day_tx["side"].str.startswith("SKIP")])
-                
-                fill_rate = day_fills / (day_fills + day_skips) if (day_fills + day_skips) > 0 else 0.0
-                
+
+                fill_rate = (
+                    day_fills / (day_fills + day_skips)
+                    if (day_fills + day_skips) > 0
+                    else 0.0
+                )
+
                 # PnL 近似: Sum(Sell Amt) - Sum(Buy Amt)
                 # 仅对闭环交易有效。如有持仓需 Mark-to-Market。
                 # 使用 Equity Curve 差值更准
                 start_eq = day_eq.iloc[0]["equity"]
                 end_eq = day_eq.iloc[-1]["equity"]
                 day_pnl = end_eq - start_eq
-                
+
                 # 估算成本 (Trade Vol * Price * Rate)
                 # day_tx 包含 SKIP，需过滤
                 day_filled_tx = day_tx[~day_tx["side"].str.startswith("SKIP")]
-                est_cost = (day_filled_tx["px"] * day_filled_tx["qty"] * COST_RATE).sum()
+                est_cost = (
+                    day_filled_tx["px"] * day_filled_tx["qty"] * COST_RATE
+                ).sum()
 
-                daily_stats.append({
-                    "日期": str(d),
-                    "交易次数": day_fills,
-                    "成交率": f"{fill_rate*100:.1f}%",
-                    "净收益": f"{day_pnl:.2f}",
-                    "估算成本": f"{est_cost:.2f}"
-                })
-                
+                daily_stats.append(
+                    {
+                        "日期": str(d),
+                        "交易次数": day_fills,
+                        "成交率": f"{fill_rate*100:.1f}%",
+                        "净收益": f"{day_pnl:.2f}",
+                        "估算成本": f"{est_cost:.2f}",
+                    }
+                )
+
         return pd.DataFrame(daily_stats)
 
 
