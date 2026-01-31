@@ -69,15 +69,20 @@ class RiskMonitor:
         self.circuit_breaker_active = False
 
         # 配置参数
+        # 配置参数 (从Config加载)
+        from hsi_hft_v3.config import RiskConfig
+
+        cfg = RiskConfig()
+
         self.config = {
-            "drift_zscore_threshold": 3.0,  # 均值漂移阈值
-            "ks_pvalue_threshold": 0.01,  # KS检验p值
-            "ic_threshold": -0.2,  # IC负向阈值
-            "sharpe_threshold": -0.5,  # Sharpe负向阈值
-            "jump_sigma_multiplier": 5.0,  # 跳变检测倍数
-            "black_loss_threshold": -1000,  # 黑盒累积亏损阈值
-            "cooldown_bars": 5,  # 警报冷却期
-            "circuit_breaker_critical": 2,  # 熔断触发的critical alerts数量
+            "drift_zscore_threshold": cfg.drift_zscore_threshold,
+            "ks_pvalue_threshold": cfg.ks_pvalue_threshold,
+            "ic_threshold": cfg.ic_threshold,
+            "sharpe_threshold": cfg.sharpe_threshold,
+            "jump_sigma_multiplier": cfg.jump_sigma_multiplier,
+            "black_loss_threshold": cfg.black_loss_threshold,
+            "cooldown_bars": cfg.cooldown_bars,
+            "circuit_breaker_critical": cfg.circuit_breaker_critical,
         }
 
     def update(

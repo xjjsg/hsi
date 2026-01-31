@@ -20,6 +20,10 @@ from collections import deque, defaultdict
 # ============================================
 # 1. 字段口径统一与健康度闸门
 # ============================================
+from hsi_hft_v3.config import RegimeConfig
+
+# 加载配置
+cfg = RegimeConfig()
 
 
 class FeatureHealthMonitor:
@@ -32,7 +36,7 @@ class FeatureHealthMonitor:
     3. 极值分位数跨度（p95-p05 > threshold）
     """
 
-    def __init__(self, window=100):
+    def __init__(self, window=cfg.health_window):
         self.window = window
         self.history = defaultdict(lambda: deque(maxlen=window))
 
@@ -56,7 +60,7 @@ class FeatureHealthMonitor:
 
         # 检查1：非零比例
         non_zero_ratio = sum(1 for v in values if abs(v) > 1e-9) / len(values)
-        if non_zero_ratio < 0.05:  # Relaxed for ETF from 0.5 -> 0.05
+        if non_zero_ratio < cfg.health_min_nonzero:
             return False, f"low_non_zero_ratio_{non_zero_ratio:.2f}"
 
         # 检查2：标准差
@@ -126,7 +130,7 @@ class IntradayQuantileBaseline:
         "afternoon": ((13, 0), (16, 0)),  # 午盘
     }
 
-    def __init__(self, bucket_minutes=5):
+    def __init__(self, bucket_minutes=cfg.baseline_bucket_minutes):
         self.bucket_minutes = bucket_minutes
 
         # {session: {bucket_id: {'metric': [values]}}}
@@ -240,7 +244,7 @@ class IntradayQuantileBaseline:
 class PriceDynamicsIndicators:
     """价格动力学指标（已验证可用）"""
 
-    def __init__(self, window=20):
+    def __init__(self, window=cfg.dynamics_window):
         self.window = window
         self.returns_buffer = deque(maxlen=window)
         self.mid_buffer = deque(maxlen=window)
@@ -345,8 +349,8 @@ class TwoTierRegimeDetector_v11:
         min_residence_action=15,
     ):
         self.baseline = baseline
-        self.min_residence_micro = 30  # Increased for stability (was 10)
-        self.min_residence_action = 50  # Increased for stability (was 15)
+        self.min_residence_micro = cfg.min_residence_micro
+        self.min_residence_action = cfg.min_residence_action
 
         # 状态
         self.current_micro = "normal"
@@ -355,12 +359,10 @@ class TwoTierRegimeDetector_v11:
         self.residence_counter_action = 0
 
         # 价格动力学
-        self.dynamics = PriceDynamicsIndicators(window=40)  # Slower window (was 20)
+        self.dynamics = PriceDynamicsIndicators(window=cfg.dynamics_window)
 
         # 健康度监控
-        self.health_monitor = FeatureHealthMonitor(
-            window=300
-        )  # Longer window for sticky prices (was 100)
+        self.health_monitor = FeatureHealthMonitor(window=cfg.health_window)
 
         # 字段映射器
         self.mapper = CanonicalFeatureMapper()
@@ -490,22 +492,22 @@ class TwoTierRegimeDetector_v11:
         # 🔧 迟滞阈值
         if self.current_micro == "illiquid":
             # 退出阈值更宽松
-            if illiquid_score_smooth < 0.3:  # 退出阈值
+            if illiquid_score_smooth < cfg.th_illiquid_exit:  # 退出阈值
                 pass  # 允许退出到normal
             else:
                 return "illiquid", 0.9
 
         if self.current_micro == "high_volatility":
-            if highvol_score_smooth < 0.3:
+            if highvol_score_smooth < cfg.th_highvol_exit:
                 pass
             else:
                 return "high_volatility", 0.85
 
         # 进入判断
-        if illiquid_score_smooth > 0.5:  # 进入阈值更严格
+        if illiquid_score_smooth > cfg.th_illiquid_enter:  # 进入阈值更严格
             return "illiquid", 0.9
 
-        if highvol_score_smooth > 0.5:
+        if highvol_score_smooth > cfg.th_highvol_enter:
             return "high_volatility", 0.85
 
         return "normal", 0.7
@@ -549,9 +551,15 @@ class TwoTierRegimeDetector_v11:
         # 2. 降低MR门槛 (0.4 -> 0.25)
         # 3. 增加竞争Buffer (0.15 -> 0.20)
 
-        if trending_score > 0.60 and trending_score > mr_score + 0.20:
+        if (
+            trending_score > cfg.th_trending_score
+            and trending_score > mr_score + cfg.th_trending_diff
+        ):
             return "trending", trending_score
-        elif mr_score > 0.25 and mr_score > trending_score + 0.20:
+        elif (
+            mr_score > cfg.th_mr_score
+            and mr_score > trending_score + cfg.th_trending_diff
+        ):
             return "mean_reverting", mr_score
         else:
             return "neutral", 0.5

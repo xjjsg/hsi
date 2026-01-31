@@ -24,46 +24,13 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
 
-# 导入配置（从trading_layer）
-TARGET_SYMBOL = "sz159920"
-AUX_SYMBOL = "sh513130"
-BAR_SIZE_S = 3
-
-# ALLOWLIST_FIELDS - 定义允许的字段
-ALLOWLIST_FIELDS = [
-    "tx_local_time",
-    "symbol",
-    "price",
-    "tick_vol",
-    "tick_amt",
-    "bp1",
-    "bv1",
-    "bp2",
-    "bv2",
-    "bp3",
-    "bv3",
-    "bp4",
-    "bv4",
-    "bp5",
-    "bv5",
-    "sp1",
-    "sv1",
-    "sp2",
-    "sv2",
-    "sp3",
-    "sv3",
-    "sp4",
-    "sv4",
-    "sp5",
-    "sv5",
-    "sentiment",
-    "premium_rate",
-    "index_price",
-    "fx_rate",
-    "iopv",
-    "fut_price",
-    "fut_imb",
-]
+# 导入配置（从config）
+from hsi_hft_v3.config import (
+    TARGET_SYMBOL,
+    AUX_SYMBOL,
+    BAR_SIZE_S,
+    ALLOWLIST_FIELDS,
+)
 
 
 # ==========================================
@@ -73,46 +40,46 @@ ALLOWLIST_FIELDS = [
 
 @dataclass
 class Bar:
-    """Standard 3s Bar Structure"""
+    """标准 3秒 K线结构"""
 
-    ts_ms: int  # Bucket end time
+    ts_ms: int  # 桶结束时间
     symbol: str
 
-    # Market Data
+    # 市场数据
     mid: float
     vwap: float
     volume: int
     amount: float
 
-    # LOB (Snapshot at bucket end)
-    bids: List[tuple] = field(default_factory=list)  # [(price, vol), ...] for 5 levels
+    # LOB (桶结束时的快照)
+    bids: List[tuple] = field(default_factory=list)  # [(价格, 数量), ...] 前5档
     asks: List[tuple] = field(default_factory=list)
 
-    # External / Derived
+    # 外部 / 衍生数据
     sentiment: float = 0.0
     premium_rate: float = 0.0
-    index_price: float = 0.0  # Added for V5 Spec
-    fx_rate: float = 0.0  # Added for V5 Spec
-    iopv: float = 0.0  # Added for V5 Spec
+    index_price: float = 0.0  # V5 规范新增
+    fx_rate: float = 0.0  # V5 规范新增
+    iopv: float = 0.0  # V5 规范新增
 
-    # Futures (Target Only, Optional)
+    # 期货数据 (Target 独有, 可选)
     fut_price: Optional[float] = None
     fut_imb: Optional[float] = None
 
     def sanity_check(self) -> bool:
-        """Basic data integrity checks"""
-        # 1. Price Logic
+        """基础数据完整性检查"""
+        # 1. 价格逻辑
         if self.mid <= 0 or not np.isfinite(self.mid):
             return False
 
-        # 2. LOB Logic
+        # 2. LOB 逻辑
         if len(self.bids) > 0 and len(self.asks) > 0:
             best_bid = self.bids[0][0]
             best_ask = self.asks[0][0]
-            if best_bid > best_ask:  # Crossed book
+            if best_bid > best_ask:  # 交叉盘
                 return False
 
-        # 3. Volume Logic
+        # 3. 成交量逻辑
         if self.volume < 0 or self.amount < 0:
             return False
 
@@ -121,7 +88,7 @@ class Bar:
 
 @dataclass
 class AlignedSample:
-    """Dual-Stream Aligned Input for Features"""
+    """用于特征的双流对齐输入"""
 
     ts_ms: int
     target: Bar
@@ -133,7 +100,7 @@ class AlignedSample:
     has_fut: bool
 
     def to_whitebox_input(self) -> Dict:
-        """Convert to dict structure for WhiteBoxFactory"""
+        """转换为 WhiteBoxFactory 的字典结构"""
         return {
             "target": self.target,
             "aux": self.aux,
@@ -150,29 +117,29 @@ class AlignedSample:
 
 
 class BarBuilder:
-    """Convert raw tick data to 3-second bars"""
+    """将原始Tick数据转换为3秒K线"""
 
     def __init__(self, symbol: str):
         self.symbol = symbol
         self.bucket_ms = BAR_SIZE_S * 1000
 
     def process_dataframe(self, df: pd.DataFrame) -> List[Bar]:
-        """Convert Raw DataFrame to List[Bar]"""
-        # 1. Filter Fields
+        """将原始 DataFrame 转换为 List[Bar]"""
+        # 1. 过滤字段
         valid_cols = [c for c in ALLOWLIST_FIELDS if c in df.columns]
         df = df[valid_cols].copy()
 
-        # 2. Add bucket time
+        # 2. 添加时间桶
         df["ts_bucket"] = (df["tx_local_time"] // self.bucket_ms) * self.bucket_ms
 
-        # 3. Slow Variable Forward Fill (V5 Spec Req)
-        # Slow vars: iopv, index_price, fx_rate, sentiment, premium_rate
+        # 3. 慢速变量前向填充 (V5 规范要求)
+        # 慢速变量: iopv, index_price, fx_rate, sentiment, premium_rate
         slow_cols = ["iopv", "index_price", "fx_rate", "sentiment", "premium_rate"]
         for c in slow_cols:
             if c in df.columns:
                 df[c] = df[c].ffill()
-                # Optional: missing mask? Spec says 'missing_mask' in Bar?
-                # Start simple: ffill ensures we don't have zeros in bars between ticks.
+                # 可选: 缺失掩码? Spec 说 Bar 中有 'missing_mask'?
+                # 先简单处理: ffill 确保 Tick 之间的 Bar 不为零。
 
         bars = []
         for ts, group in df.groupby("ts_bucket"):
@@ -184,10 +151,10 @@ class BarBuilder:
         return bars
 
     def _aggregate_group(self, ts: int, group: pd.DataFrame) -> Bar:
-        """Aggregate tick data within a bucket to create a Bar"""
+        """在时间桶内聚合 Tick 数据以创建 Bar"""
         last_row = group.iloc[-1]
 
-        # LOB Snapshot
+        # LOB 快照
         bids = []
         asks = []
         for i in range(1, 6):
@@ -196,12 +163,12 @@ class BarBuilder:
             if f"sp{i}" in last_row and f"sv{i}" in last_row:
                 asks.append((float(last_row[f"sp{i}"]), float(last_row[f"sv{i}"])))
 
-        # Volume Aggregation
+        # 成交量聚合
         vol = int(group["tick_vol"].sum())
         amt = float(group["tick_amt"].sum())
         vwap = amt / vol if vol > 0 else last_row.get("price", 0.0)
 
-        # Futures (Optional)
+        # 期货 (可选)
         fut_price = last_row.get("fut_price", None)
         fut_imb = last_row.get("fut_imb", None)
         # Handle nan
@@ -236,32 +203,36 @@ class BarBuilder:
 
 
 class DualStreamAligner:
-    """Strict Causal Alignment using Asof Logic"""
+    """基于 Asof 逻辑的严格因果对齐"""
 
     def __init__(self, max_lag_ms: int = 30000):
-        self.max_lag_ms = max_lag_ms
+
+        from hsi_hft_v3.config import DataConfig
+
+        data_cfg = DataConfig()
+        self.max_lag_ms = max_lag_ms if max_lag_ms != 30000 else data_cfg.max_lag_ms
 
     def align(self, target_bars: List[Bar], aux_bars: List[Bar]) -> List[AlignedSample]:
         """
-        Align target and auxiliary bar streams with causal constraints
+        对齐 Target 和 Aux 两个数据流，并应用因果约束
 
-        For each target bar, find the most recent aux bar that arrived before it,
-        subject to max_lag_ms constraint.
+        对于每个 Target Bar，找到在其之前到达的最近的 Aux Bar，
+        前提是滞后时间不超过 max_lag_ms。
         """
-        # Ensure strict sorted order
+        # 确保严格的时间排序
         target_bars.sort(key=lambda x: x.ts_ms)
         aux_bars.sort(key=lambda x: x.ts_ms)
 
         aligned_samples = []
 
-        # Dual Pointer Logic
+        # 双指针逻辑
         aux_idx = 0
         n_aux = len(aux_bars)
         last_valid_aux = None
 
         for t_bar in target_bars:
-            # Advance aux pointer to find the snapshot right before or at t_bar.ts_ms
-            # We want last aux where aux.ts_ms <= t_bar.ts_ms
+            # 推进 Aux 指针以找到 t_bar.ts_ms 之前或同时的快照
+            # 我们需要满足 aux.ts_ms <= t_bar.ts_ms 的最后一个 aux
 
             while aux_idx < n_aux and aux_bars[aux_idx].ts_ms <= t_bar.ts_ms:
                 last_valid_aux = aux_bars[aux_idx]
@@ -305,7 +276,7 @@ class DualStreamAligner:
 
 
 class V5DataLoader:
-    """High-level data loader for V5 architecture"""
+    """V5 架构的高级数据加载器"""
 
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
@@ -313,21 +284,26 @@ class V5DataLoader:
         self.aux_symbol = AUX_SYMBOL
 
     def load_date_range(
-        self, start_date: str = None, end_date: str = None
+        self,
+        start_date: str = None,
+        end_date: str = None,
+        exclude_dates: List[str] = None,
     ) -> Dict[str, List[AlignedSample]]:
         """
-        Load data for a range of dates.
+        加载指定日期范围的数据。
         Returns: Dict {date_str: List[AlignedSample]}
         """
         pairs = self._match_files()
         results = {}
 
-        # Filter by date
+        # 按日期过滤
         filtered_pairs = []
         for date, tgt_path, aux_path in pairs:
             if start_date and date < start_date:
                 continue
             if end_date and date > end_date:
+                continue
+            if exclude_dates and date in exclude_dates:
                 continue
             filtered_pairs.append((date, tgt_path, aux_path))
 
@@ -364,17 +340,17 @@ class V5DataLoader:
         return results
 
     def _match_files(self) -> List[Tuple[str, str, str]]:
-        """Find paired files by date"""
-        # Assume structure: data_dir/sz159920/*.csv
+        """按日期匹配文件"""
+        # 假设结构: data_dir/sz159920/*.csv
         tgt_pattern = os.path.join(self.data_dir, self.target_symbol, "*.csv")
-        # Assume structure: data_dir/sh513130/*.csv
+        # 假设结构: data_dir/sh513130/*.csv
         aux_pattern = os.path.join(self.data_dir, self.aux_symbol, "*.csv")
 
         tgt_files = glob.glob(tgt_pattern)
         aux_files = glob.glob(aux_pattern)
 
         print(
-            f"[Loader] Scanning: {len(tgt_files)} target files, {len(aux_files)} aux files"
+            f"[Loader] 扫描到: {len(tgt_files)} 个目标文件, {len(aux_files)} 个辅助文件"
         )
 
         def get_date(path):

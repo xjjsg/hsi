@@ -58,7 +58,9 @@ class RegimeAdaptiveResidualCombine(nn.Module):
         # ========================================
         # 默认α配置（无体制检测时的fallback）
         # ========================================
-        self.default_alpha = 0.5
+        from hsi_hft_v3.config import ModelConfig
+
+        self.default_alpha = ModelConfig().default_alpha
 
     def forward(
         self,
@@ -162,7 +164,7 @@ class RegimeAdaptiveResidualCombine(nn.Module):
 
 class WrongGatedCombine(nn.Module):
     """
-    错误的加权平均公式（评估报告建议）
+    [Research] 错误的加权平均公式（评估报告建议，仅供对比研究）
 
     问题：当α=0时，y_white也变成0了！
     应该是：完全忽略黑盒，但保留白盒基线

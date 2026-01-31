@@ -24,122 +24,30 @@ from typing import List, Dict, Tuple, Deque
 from collections import deque
 
 # 导入数据层的依赖（需要 AlignedSample）
-from hsi_hft_v3.data_layer import AlignedSample
-
+from .data_layer import AlignedSample
 
 # ==========================================
 # 1. 全局配置 (Global Configuration)
 # ==========================================
-
-# 1.1 Global Identity & Scope
-TARGET_SYMBOL = "sz159920"
-AUX_SYMBOL = "sh513130"
-BAR_SIZE_S = 3  # 3-second bars
-TIMEZONE = "Asia/Shanghai"
-
-# 1.2 Execution & Cost Model
-COST_RATE = 0.0001  # 1bp, single-side
-TICK_SIZE = 0.001  # Minimum price move
-LATENCY_BARS = 1  # Signal at t -> Trade at t + 1
-TRADE_QTY = 1000  # Simulation quantity
-
-
-@dataclass
-class ExecutionConfig:
-    """Execution configuration"""
-
-    order_type: str = "TAKER"  # Always taker
-    fill_mode: str = "L1_IOC"  # Only fill at Level 1, IOC
-    slippage_bps: float = 0.0  # Optional slippage simulation
-
-
-# 1.3 Modeling Objectives
-PREDICT_HORIZON_S = 120  # H* = 120s
-K_BARS = PREDICT_HORIZON_S // BAR_SIZE_S  # 40 bars
-LOOKBACK_BARS = 100  # Feature window
-BLACKBOX_DIM = 32  # Latent dimension (Spec Requirement)
-
-
-@dataclass
-class LabelConfig:
-    """Label generation configuration for training"""
-
-    use_cost_gate: bool = False  # Strict hit definition
-    adverse_bps: float = 20.0  # Risk threshold in bps
-    embargo_bars: int = LOOKBACK_BARS + K_BARS + LATENCY_BARS + 10  # Data split buffer
-
-
-# 1.4 Policy Thresholds
-@dataclass
-class PolicyConfig:
-    """Trading policy configuration with adaptive thresholds"""
-
-    # Standard Thresholds (with Aux)
-    # Relaxed for initial testing
-    th_p_hit: float = 0.51
-    th_p_tau_60: float = 0.50
-    th_risk_enter: float = 0.40
-
-    # Conservative Thresholds (No Aux)
-    th_p_hit_noaux: float = 0.70
-    th_p_tau_60_noaux: float = 0.80
-    th_risk_enter_noaux: float = 0.10
-
-    # Exit & Gates
-    th_risk_exit: float = 0.25
-    max_hold_bars: int = K_BARS
-    cooldown_bars: int = 20
-
-    # Microstructure Gates
-    spread_max_bps: float = 10.0
-    depth_min_qty: int = 5000
-    vpin_max_z: float = 3.0
-    vpin_exit_z: float = 3.5
-    lambda_exit_z: float = 3.0
-
-
-# 1.5 Data Contract (Field Lists)
-ALLOWLIST_FIELDS = [
-    "tx_local_time",
-    "tx_server_time",
-    "price",
-    "tick_vol",
-    "tick_amt",
-    "tick_vwap",
-    "bp1",
-    "bv1",
-    "sp1",
-    "sv1",
-    "bp2",
-    "bv2",
-    "sp2",
-    "sv2",
-    "bp3",
-    "bv3",
-    "sp3",
-    "sv3",
-    "bp4",
-    "bv4",
-    "sp4",
-    "sv4",
-    "bp5",
-    "bv5",
-    "sp5",
-    "sv5",
-    "sentiment",
-    "premium_rate",
-    "iopv",
-    "index_price",
-    "fx_rate",
-    # Only for 159920
-    "fut_price",
-    "fut_mid",
-    "fut_imb",
-    "fut_delta_vol",
-    "fut_pct",
-]
-
-BLOCKLIST_FIELDS = ["idx_delay_ms", "fut_delay_ms", "data_flags"]
+from hsi_hft_v3.config import (
+    TARGET_SYMBOL,
+    AUX_SYMBOL,
+    BAR_SIZE_S,
+    TIMEZONE,
+    COST_RATE,
+    TICK_SIZE,
+    LATENCY_BARS,
+    TRADE_QTY,
+    ExecutionConfig,
+    LabelConfig,
+    PolicyConfig,
+    ALLOWLIST_FIELDS,
+    BLOCKLIST_FIELDS,
+    PREDICT_HORIZON_S,
+    K_BARS,
+    LOOKBACK_BARS,
+    BLACKBOX_DIM,
+)
 
 
 # ==========================================
@@ -174,17 +82,17 @@ class PolicyOutput:
 
 class StateMachine:
     """
-    State machine trading policy
+    状态机交易策略
 
-    States:
-    - FLAT: No position, looking for entry signals
-    - LONG: Holding long position, monitoring exit conditions
-    - COOLDOWN: Post-trade cooldown period
+    状态 (States):
+    - FLAT: 空仓，寻找入场信号
+    - LONG: 持有多头仓位，监控出场条件
+    - COOLDOWN: 交易后冷却期
 
-    Transitions:
-    FLAT -> LONG: Entry signal (p_hit, p_tau, risk gates passed)
-    LONG -> COOLDOWN: Exit signal (max hold, risk, or adverse conditions)
-    COOLDOWN -> FLAT: Cooldown period expired
+    转换 (Transitions):
+    FLAT -> LONG: 入场信号 (p_hit, p_tau, 风控通过)
+    LONG -> COOLDOWN: 出场信号 (最大持有时间, 风控触发, 或逆向条件)
+    COOLDOWN -> FLAT: 冷却期结束
     """
 
     def __init__(self, config: PolicyConfig):
@@ -202,22 +110,22 @@ class StateMachine:
         aux_available: bool,
     ) -> PolicyOutput:
         """
-        Main decision function
+        主要决策函数
 
         Args:
-            model_probs: Model predictions (p_hit, P_tau_le_60s, risk)
-            white_risk: White-box risk indicators (spread_bps, vpin_z, etc.)
-            aux_available: Whether auxiliary data is available
+            model_probs: 模型预测 (p_hit, P_tau_le_60s, risk)
+            white_risk: 白盒风控指标 (spread_bps, vpin_z, etc.)
+            aux_available: 是否有辅助数据
 
         Returns:
-            PolicyOutput with action and reason
+            PolicyOutput 包含动作和原因
         """
 
-        # 0. Check Pending
+        # 0. 检查挂单
         if self.pending_action is not None:
             return PolicyOutput(Action.HOLD, "PENDING_EXEC", {"state": self.state.name})
 
-        # 1. Update Cooldown
+        # 1. 更新冷却状态
         if self.state == State.COOLDOWN:
             self.cooldown_rem -= 1
             if self.cooldown_rem <= 0:
@@ -225,7 +133,7 @@ class StateMachine:
                 return PolicyOutput(Action.HOLD, "COOLDOWN_END", {})
             return PolicyOutput(Action.HOLD, "IN_COOLDOWN", {})
 
-        # 2. Select Thresholds (Adaptive based on aux availability)
+        # 2. 选择阈值 (根据辅助数据可用性自适应)
         if aux_available:
             th_hit = self.cfg.th_p_hit
             th_tau = self.cfg.th_p_tau_60
@@ -235,10 +143,10 @@ class StateMachine:
             th_tau = self.cfg.th_p_tau_60_noaux
             th_risk = self.cfg.th_risk_enter_noaux
 
-        # 3. Extract Probabilities
+        # 3. 提取概率
         p_hit = model_probs.get("p_hit", 0.0)
         p_tau = model_probs.get("P_tau_le_60s", 0.0)
-        p_risk = model_probs.get("risk", 1.0)  # default high risk
+        p_risk = model_probs.get("risk", 1.0)  # 默认高风险
 
         meta = {
             "p_hit": p_hit,
@@ -247,19 +155,19 @@ class StateMachine:
             "state": self.state.name,
         }
 
-        # 4. EXIT LOGIC
+        # 4. 出场逻辑 (EXIT LOGIC)
         if self.state == State.LONG:
             self.hold_bars += 1
 
-            # Max Hold
+            # 最大持有时间
             if self.hold_bars >= self.cfg.max_hold_bars:
                 return PolicyOutput(Action.EXIT_LONG, "MAX_HOLD", meta)
 
-            # Risk Gates
+            # 风控门槛
             if p_risk > self.cfg.th_risk_exit:
                 return PolicyOutput(Action.EXIT_LONG, "RISK_EXIT", meta)
 
-            # Whitebox Reversal / Micro Risk (Simplified)
+            # 白盒反转 / 微观风控 (简化版)
             if white_risk.get("vpin_z", 0) > self.cfg.vpin_exit_z:
                 return PolicyOutput(Action.EXIT_LONG, "VPIN_EXIT", meta)
 
@@ -268,9 +176,9 @@ class StateMachine:
 
             return PolicyOutput(Action.HOLD, "HOLD_LONG", meta)
 
-        # 5. ENTRY LOGIC (FLAT)
+        # 5. 入场逻辑 (ENTRY LOGIC - FLAT)
         if self.state == State.FLAT:
-            # Whitebox Gates (Entry)
+            # 白盒门槛 (Entry)
             if white_risk.get("spread_bps", 0) > self.cfg.spread_max_bps:
                 return PolicyOutput(Action.HOLD, "SPREAD_GATE", meta)
 
@@ -280,9 +188,9 @@ class StateMachine:
             if white_risk.get("vpin_z", 0) > self.cfg.vpin_max_z:
                 return PolicyOutput(Action.HOLD, "VPIN_GATE", meta)
 
-            # Signals
+            # 信号判断
             if p_hit >= th_hit and p_tau >= th_tau and p_risk <= th_risk:
-                # Do NOT transition here. Wait for execution callback.
+                # 此时不立即转换状态，等待执行回调
                 return PolicyOutput(Action.ENTER_LONG, "SIGNAL_ENTRY", meta)
 
             return PolicyOutput(Action.HOLD, "NO_SIGNAL", meta)
@@ -336,14 +244,14 @@ class Order:
 
 class BacktestEngine:
     """
-    Event-driven backtest engine with latency simulation
+    事件驱动的回测引擎，支持延迟模拟
 
-    Features:
-    - Latency queue for realistic order execution
-    - L1 taker execution (IOC at best bid/ask)
-    - Liquidity checks (all-or-none fills)
-    - Mark-to-market equity tracking
-    - RiskMonitor integration (NEW)
+    特性:
+    - 延迟队列模拟真实的订单执行
+    - L1 Taker 执行 (IOC @ 最佳买卖价)
+    - 流动性检查 (全部成交或不成交)
+    - 逐日盯市 (Mark-to-market) 权益跟踪
+    - RiskMonitor 集成 (NEW)
     """
 
     def __init__(self, policy: StateMachine, baseline_stats=None):
@@ -366,11 +274,11 @@ class BacktestEngine:
 
     def run(self, samples: List[AlignedSample], model_outputs: List[Dict]):
         """
-        Run backtest
+        运行回测
 
         Args:
-            samples: List of aligned samples (data)
-            model_outputs: List of model predictions (aligned with samples)
+            samples: 对齐后的样本列表 (数据)
+            model_outputs: 模型预测列表 (与样本对齐)
         """
         n = len(samples)
         for i in range(n):
@@ -412,14 +320,14 @@ class BacktestEngine:
                 if i % 50 == 0 and len(self.risk_monitor.alerts) > 0:
                     print(f"\n[Bar {i}] {self.risk_monitor.get_status_report()}")
 
-            # 1. Match Orders (Time >= trade_time)
+            # 1. 撮合订单 (时间 >= trade_time)
             self._match_orders(sample)
 
-            # 2. Update Policy (Get Action)
-            # Read white_risk passed from pipeline (calculated from features)
+            # 2. 更新策略 (获取动作)
+            # 读取从 pipeline 传递的 white_risk (由特征计算得出)
             white_risk = model_out.get("white_risk", {})
             if not white_risk:
-                # Fallback if not provided (e.g. earlier pipeline version)
+                # 如果未提供则回退 (例如旧版 pipeline)
                 white_risk = {"spread_bps": 0.0, "vpin_z": 0.0}
 
             pol_out = self.policy.decide(
@@ -428,7 +336,7 @@ class BacktestEngine:
                 aux_available=sample.aux_available,
             )
 
-            # 3. Generate Order (Latency)
+            # 3. 生成订单 (延迟)
             if pol_out.action == Action.ENTER_LONG:
                 trade_ts = sample.ts_ms + (LATENCY_BARS * 3000)
                 order = Order("BUY", sample.ts_ms, trade_ts, TRADE_QTY)
@@ -441,7 +349,7 @@ class BacktestEngine:
                 self.latency_queue.append(order)
                 self.policy.on_order_sent(Action.EXIT_LONG)
 
-            # 4. Mark to Market (Simulated)
+            # 4. 逐日盯市 (模拟)
             mid = sample.target.mid
             equity = self.cash + (self.position * mid)
             self.equity_curve.append(
@@ -514,18 +422,25 @@ def calculate_metrics(
     trades: List[Dict], equity_curve: List[Dict], initial_cap: float = 1e6
 ) -> Dict:
     """
-    Calculate comprehensive backtest metrics
+    计算综合回测指标
 
     Args:
-        trades: List of trade records
-        equity_curve: List of equity snapshots over time
-        initial_cap: Initial capital
+        trades: 交易记录列表
+        equity_curve: 权益曲线列表
+        initial_cap: 初始资金
 
     Returns:
-        Dict of performance metrics
+        Dict 包含性能指标
     """
     if not trades:
-        return {"total_trades": 0, "pnl": 0.0, "sharpe": 0.0, "drawdown": 0.0}
+        return {
+            "n_trades": 0,
+            "total_pnl": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown_pct": 0.0,
+            "fill_rate_pct": 0.0,
+            "est_cost": 0.0,
+        }
 
     # Trade Analysis
     df_tx = pd.DataFrame(trades)

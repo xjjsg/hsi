@@ -8,8 +8,8 @@ EPS = 1e-9
 
 class RollingStats:
     """
-    O(1) Rolling Mean, Variance, Z-Score, Slope.
-    Maintain sums of x and x^2.
+    O(1) 滚动均值、方差、Z-Score、斜率。
+    维护 x 和 x^2 的累计和。
     """
 
     def __init__(self, window: int):
@@ -63,8 +63,8 @@ class RollingStats:
 
 class RollingCov:
     """
-    O(1) Rolling Covariance and Correlation between two streams X and Y.
-    Maintain sums of x, y, x^2, y^2, xy.
+    O(1) 滚动协方差和相关系数 (两个流 X 和 Y)。
+    维护 x, y, x^2, y^2, xy 的累计和。
     """
 
     def __init__(self, window: int):
@@ -143,17 +143,21 @@ class RollingCov:
 
 class WhiteBoxFeatureFactory:
     """
-    19 Factors + Unified Derivative Rules
-    Strict Implementation of V5 Spec.
+    19 个因子 + 统一衍生规则
+    V5 规范的严格实现。
     """
 
     def __init__(self):
-        # Config
-        self.W_set = [20, 100, 600]
-        self.L_DEPTH = 5
-        self.tick_size = 0.001
-        self.iofi_weights = np.array([1.0, 0.8, 0.6, 0.4, 0.2])
-        self.leadlag_lags = [1, 2, 3, 5]
+        # Config (Load from Central Config)
+        from hsi_hft_v3.config import FeatureConfig, TICK_SIZE
+
+        cfg = FeatureConfig()
+
+        self.W_set = cfg.windows
+        self.L_DEPTH = cfg.depth_levels
+        self.tick_size = TICK_SIZE
+        self.iofi_weights = np.array(cfg.iofi_weights)
+        self.leadlag_lags = cfg.lead_lag_lags
 
         # State Management (Previous Bars for diffs)
         self.prev_bar_tgt: Optional[Bar] = None
@@ -175,11 +179,11 @@ class WhiteBoxFeatureFactory:
 
     def get_derived_keys(self) -> List[str]:
         """
-        Return the deterministic list of feature keys (Audit requirement).
-        Order: For each raw_feature (sorted), for each window (sorted), z then slope.
+        返回确定性的特征键列表 (审计要求)。
+        顺序: 对每个原始特征 (排序)，对每个窗口 (排序)，先 z 后 slope。
         """
-        # Hardcoded raw feature names based on mining logic
-        # This list MUST match what is produced in compute()
+        # 基于挖掘逻辑硬编码的原始特征名称
+        # 此列表必须与 compute() 中生成的匹配
         raw_names = [
             "QI_L1",
             "QI_L5",
@@ -250,17 +254,17 @@ class WhiteBoxFeatureFactory:
 
     def compute(self, sample: AlignedSample) -> Dict:
         """
-        Main Entry Point.
-        Input: AlignedSample
-        Output: Full WhiteBox Contract
+        主入口点。
+        输入: AlignedSample
+        输出: 完整的 WhiteBox 契约
         """
         masks = {
             "aux_available": 1.0 if sample.aux_available else 0.0,
             "has_fut": 1.0 if sample.has_fut else 0.0,
         }
 
-        # 1. Base Variables & Transforms
-        # Need ret_t for both
+        # 1. 基础变量与变换
+        # 两者都需要 ret_t
         vars_tgt = self._calc_base_vars(sample.target, self.prev_bar_tgt)
         vars_aux = (
             self._calc_base_vars(sample.aux, self.prev_bar_aux)
@@ -268,45 +272,45 @@ class WhiteBoxFeatureFactory:
             else self._empty_base_vars()
         )
 
-        # Update Return Buffers for Lead-Lag
-        # If aux not available, push 0 return
+        # 更新 Lead-Lag 的收益率缓冲区
+        # 如果 aux 不可用，推入 0 收益
         self.aux_ret_buffer.append(vars_aux["ret"])
 
-        # 2. A1: Micro-structure (Target Only)
+        # 2. A1: 微观结构 (Micro-structure) - 仅 Target
         a1_feats = self._mining_A1_micro(sample.target, vars_tgt, self.prev_bar_tgt)
 
-        # 3. A2: Flow & Arb (Target Only)
+        # 3. A2: 资金流与套利 (Flow & Arb) - 仅 Target
         a2_feats = self._mining_A2_flow(sample.target, vars_tgt)
 
-        # 4. A3: Futures (Target Only, gated)
+        # 4. A3: 期货 (Futures) - 仅 Target (门控)
         a3_feats = self._mining_A3_fut(sample.target, vars_tgt, sample.has_fut)
 
-        # 5. A4: Cross (Tgt vs Aux)
+        # 5. A4: 交叉流 (Cross Tgt vs Aux)
         a4_feats = self._mining_A4_cross(vars_tgt, vars_aux, sample.aux_available)
 
-        # 6. Unified Derivatives (RegimeZ)
-        # Collect all raw features
-        # Note: A1, A2, A3 are "Target Raw" (or mixed).
-        # Spec asks for separate dicts.
+        # 6. 统一衍生 (Unified Derivatives - RegimeZ)
+        # 收集所有原始特征 (Raw Features)
+        # 注意: A1, A2, A3 是 "Target Raw" (或混合)。
+        # 规范要求分开的字典。
 
         white_target_raw = {**a1_feats, **a2_feats, **a3_feats}
-        # Aux raw? Not strictly A4.
-        # Requirement says "white_aux_raw". We can compute basic A1/A2 for Aux too?
-        # User 3.2 Output: white_aux_raw.
-        # Let's compute a simplified set for Aux (Just basics, no fancy)
+        # Aux raw? 并非严格的 A4。
+        # 需求说 "white_aux_raw"。我们可以计算 Aux 的基本 A1/A2 吗？
+        # 用户需求 3.2 输出: white_aux_raw。
+        # 让我们为 Aux 计算一个简化集 (仅基础，无花哨功能)
         if sample.aux_available:
-            # Full mining for Aux? Too expensive/not needed?
-            # Let's compute Basic A1 for Aux as "Raw Aux" which is useful.
+            # [Research] Aux 全量挖掘？当前仅计算基础 A1 作为 "Raw Aux" (效率考量)。
+            # 让我们计算 Aux 的基础 A1 作为 "Raw Aux"，这很有用。
             white_aux_raw = self._mining_A1_micro(
                 sample.aux, vars_aux, self.prev_bar_aux
             )
         else:
-            # Empty Dict with correct keys 0.0
+            # 空字典，带有正确的键 (值为 0.0)
             white_aux_raw = {k: 0.0 for k in a1_feats.keys()}
 
         white_cross_raw = a4_feats
 
-        # Combine all for rolling updates
+        # 合并所有特征以进行滚动更新
         all_to_roll = {**white_target_raw, **white_aux_raw, **white_cross_raw}
         white_derived = {}
 
@@ -317,21 +321,21 @@ class WhiteBoxFeatureFactory:
                 white_derived[f"{name}_z_{w}"] = st.zscore()
                 white_derived[f"{name}_slope_{w}"] = st.slope()
 
-        # Special Logic for DynamicBeta (Cov based)
-        # We need to update Cov stats for specific pairs?
-        # Actually Dynamic Beta is A4 feature itself.
+        # DynamicBeta 的特殊逻辑 (基于 Cov)
+        # 我们是否需要更新特定对的 Cov 统计？
+        # 实际上 Dynamic Beta 是 A4 特征本身。
         # "Dynamic Beta Divergence... beta_W = Cov_W / Var_W"
-        # This implies Beta calculation happens INSIDE A4 or derived?
-        # Spec 5-A4-(15) says "beta_W" is part of the computation.
-        # So we handle 'RollingCov' logic inside _mining_A4 or separate.
-        # Let's put complex Window Logic (Cov/LeadLag) inside the mining functions
-        # because they produce the "Raw" features for output (e.g. divergence).
+        # 这意味着 Beta 计算发生在 A4 内部或衍生中？
+        # 规范 5-A4-(15) 说 "beta_W" 是计算的一部分。
+        # 所以我们在 _mining_A4 或单独处理 'RollingCov' 逻辑。
+        # 让我们把复杂的窗口逻辑 (Cov/LeadLag) 放在挖掘函数内部
+        # 因为它们生成用于输出的 "Raw" 特征 (例如 divergence)。
 
         # Wait, divergence = ret_aux - beta_W * ret_tgt.
-        # This `divergence` is the RAW feature. `beta_W` is an intermediate.
-        # Yes.
+        # 这个 `divergence` 是原始特征。`beta_W` 是中间变量。
+        # 是的。
 
-        # Update State
+        # 更新状态
         self.prev_bar_tgt = sample.target
         if sample.aux_available:
             self.prev_bar_aux = sample.aux
@@ -348,7 +352,7 @@ class WhiteBoxFeatureFactory:
     # Helpers
     # ==========================================
     def _calc_base_vars(self, bar: Bar, prev_bar: Optional[Bar]) -> Dict:
-        """4) Basic Defs"""
+        """4) 基础定义"""
         bp1 = bar.bids[0][0] if bar.bids else 0
         sp1 = bar.asks[0][0] if bar.asks else 0
         mid = (bp1 + sp1) / 2 if (bp1 > 0 and sp1 > 0) else 0
@@ -487,16 +491,16 @@ class WhiteBoxFeatureFactory:
         mid = v["mid"]
         f["mp_dev_bps"] = ((mp - mid) / (mid + EPS)) * 10000.0
 
-        # (5) VPIN Proxy
+        # (5) VPIN 代理
         # sign_proxy = sign(tick_vwap - mid_t-1)
         # VPIN = |Sum(Vol * I[sign>0]) - Sum(Vol * I[sign<0])| / Sum(Vol)
-        # Needs Rolling Window! Spec says VPIN_W.
-        # So we produce Raw SignedVol, then Rolling Logic calculates VPIN?
-        # No, VPIN is inherently a window feature.
-        # Spec says: VPIN_W_proxy.
-        # I should compute "signed_vol" here (as raw), then compute VPIN_W in "Combined" phase?
-        # But RollingStats only does Mean/Var. It doesn't do |Sum pos - Sum neg|.
-        # Actually: |Sum(V+)| - |Sum(V-)| is equiv to |Sum(SignedVol)|
+        # 需要滚动窗口！规范说 VPIN_W。
+        # 所以我们产生原始 SignedVol，然后滚动逻辑计算 VPIN？
+        # 不，VPIN 本质上是一个窗口特征。
+        # 规范说: VPIN_W_proxy。
+        # 我应该在这里计算 "signed_vol" (作为 raw)，然后在 "Combined" 阶段计算 VPIN_W？
+        # 但 RollingStats 只做 Mean/Var。它不做 |Sum pos - Sum neg|。
+        # 实际上: |Sum(V+)| - |Sum(V-)| 等价于 |Sum(SignedVol)|
         # VPIN = | Sum(SignedVol) | / Sum(TotalVol).
         # We can track Sum(SignedVol) and Sum(TotalVol) using RollingStats (Sum part).
         # So we output `signed_vol` and `total_vol` as RAW features.
@@ -582,9 +586,9 @@ class WhiteBoxFeatureFactory:
 
         # (7) CFT
         # EMA span=20, 100
-        # Need Stateful EMAs. Store in self.stats?
-        # Or simple dict cache?
-        # Let's use a dict `self.emas`
+        # 需要有状态的 EMA。存储在 self.stats 中？
+        # 或者简单的字典缓存？
+        # 让我们使用字典 `self.emas`
         if not hasattr(self, "emas"):
             self.emas = {}
 
@@ -603,30 +607,30 @@ class WhiteBoxFeatureFactory:
 
         # (8) FPD
         # Z(CFT_fast) - Z(log_ret).
-        # Wait, I need Z-score of CFT_fast. This implies CFT_fast is the raw input to RollingStats?
-        # But FPD needs to be output NOW.
-        # Meaning I need to compute Z(CFT_fast) inside here.
-        # This creates dependency: Raw -> Rolling -> Derived -> Combined Factor.
-        # Spec says FPD = zscoreW(CFT)...
-        # So I must track CFT history.
-        # Use default W=100 for FPD? Spec says "zscoreW". Which W?
-        # "Unified rules W={20,100,600}". So FPD_20, FPD_100?
-        # Let's compute FPD_100 as the "canonical" FPD feature for now, or all W.
-        # Let's output all W.
+        # 等等，我需要 CFT_fast 的 Z-score。这意味着 CFT_fast 是 RollingStats 的原始输入？
+        # 但 FPD 需要立即输出。
+        # 意味着我必须在这里计算 Z(CFT_fast)。
+        # 这创建了依赖关系：Raw -> Rolling -> Derived -> Combined Factor。
+        # 规范说 FPD = zscoreW(CFT)...
+        # 所以我必须跟踪 CFT 历史。
+        # 对 FPD 使用默认 W=100？规范说 "zscoreW"。哪个 W？
+        # "统一规则 W={20,100,600}"。所以 FPD_20, FPD_100?
+        # 让我们暂时计算 FPD_100 作为 "canonical" FPD 特征，或全部 W。
+        # 让我们输出所有 W。
 
         # (9) PFA = Z(Sent) - Z(Prem)
         # (10) PremMeanRev
 
-        # To avoid recursion hell, let's treat "CFT", "Sentiment", "Premium" as Raw features being tracked.
-        # And FPD/PFA are computed from the derived Z-scores.
-        # BUT user output spec puts FPD in "white_target_raw"?
-        # Or is FPD a derived feature?
+        # 为避免递归地狱，让我们将 "CFT", "Sentiment", "Premium" 视为正在跟踪的原始特征。
+        # FPD/PFA 根据衍生的 Z-scores 计算。
+        # 但用户输出规范将 FPD 放在 "white_target_raw" 中？
+        # 还是 FPD 是衍生特征？
         # "A2 资金流与套利类... (8) FPD ... 依赖 sentiment, mid"
-        # It seems these are expected in the 'white_target_raw' output.
-        # This implies 'white_target_raw' can contain window-dependent values?
-        # Yes, like FLP, VPIN_W.
+        # 看来这些应包含在 'white_target_raw' 输出中。
+        # 这意味着 'white_target_raw' 可以包含窗口相关的值？
+        # 是的，比如 FLP, VPIN_W。
 
-        # So I need to pull Z-scores here.
+        # 所以我需要在这里提取 Z-scores。
         for w in self.W_set:
             # Stats for components
             st_cft = self._get_stat("internal_cft", w)
@@ -696,10 +700,10 @@ class WhiteBoxFeatureFactory:
             # Return empty structure
             return {"FLP": 0.0, "FSB": 0.0}
 
-        # Need fut_price, fut_imb
-        # Assuming they are on Bar.
-        # Check `bar_builder.py` spec?
-        # For now, safe getattr.
+        # 需要 fut_price, fut_imb
+        # 假设它们在 Bar 上。
+        # 检查 `bar_builder.py` 规范？
+        # 目前使用安全的 getattr。
         fp = getattr(bar, "fut_price", 0)
         if fp is None:
             fp = 0
@@ -709,7 +713,7 @@ class WhiteBoxFeatureFactory:
 
         if fp > 0:
             # Delta ln fut
-            # Need prev fut price. Store in state?
+            # 需要 prev fut price。存储在状态中？
             if not hasattr(self, "prev_fut"):
                 self.prev_fut = fp
             fut_ret = np.log(fp) - np.log(self.prev_fut) if self.prev_fut > 0 else 0
@@ -742,7 +746,7 @@ class WhiteBoxFeatureFactory:
             f["flow_ratio"] = 0.0
             return f
 
-        # (14) LLT (Simple RS)
+        # (14) LLT (简单 RS)
         f["LLT_rs"] = va["ret"] - vt["ret"]
 
         # (15) Dynamic Beta Divergence
@@ -762,13 +766,13 @@ class WhiteBoxFeatureFactory:
 
         # (16) Lead-Lag Corr
         # max_l Corr(aux_{t-l}, tgt_t)
-        # We need aux returns from t-1, t-2 ...
-        # self.aux_ret_buffer has [ret_{t-max}, ..., ret_{t}]
-        # Ensure we have enough history
-        # Note: Corr is Rolling! Corr_W.
-        # This implies we need `L` separate RollingCov stats?
-        # Yes: "LeadLag_1", "LeadLag_2"...
-        # Then calculate max across them.
+        # 我们需要 aux t-1, t-2... 的收益率
+        # self.aux_ret_buffer 包含 [ret_{t-max}, ..., ret_{t}]
+        # 确保有足够的历史
+        # 注意: Corr 是滚动的！Corr_W。
+        # 这意味着我们需要 `L` 个单独的 RollingCov 统计？
+        # 是的: "LeadLag_1", "LeadLag_2"...
+        # 然后取最大值。
 
         max_corr = -1.0
         best_lag = 0
@@ -785,11 +789,11 @@ class WhiteBoxFeatureFactory:
             else:
                 ra_lag = 0.0
 
-            # Update specific Cov tracker for this lag
-            # We pick fixed W=600 (long window) or largest W for stability?
-            # Spec says "Corr(l)" implies single number per l? Or multiscale?
-            # "output: leadlag_corr_max" implies one scalar.
-            # Let's use W=100 (mid) as default for this meta-feature.
+            # 更新此时延的特定 Cov 追踪器
+            # 为了稳定性，我们选择固定 W=600 (长窗口) 或最大 W？
+            # 规范说 "Corr(l)" 暗示每个 l 一个值？还是多尺度？
+            # "output: leadlag_corr_max" 暗示一个标量。
+            # 让我们使用 W=100 (中等) 作为此元特征的默认值。
             cv_ll = self._get_cov(f"leadlag_{lag}", 100)
             cv_ll.update(ra_lag, rt)  # X=Aux_lag, Y=Tgt
 
@@ -801,21 +805,9 @@ class WhiteBoxFeatureFactory:
         f["leadlag_corr_max"] = max_corr
         f["leadlag_lag"] = float(best_lag)
 
-        # (17) Flow Ratio
-        # Need raw sentiment.
-        # Accessing private attribute logic or strict passed in logic?
-        # I don't have raw sentiment passed into this func directly (only derived vars?)
-        # Wait, vars_tgt has basic vars, but sentiment not in "basic".
-        # Let's assume we can get it from ... where?
-        # I didn't include sentiment in _calc_base_vars. FIX IT.
-        # -> Fixed in _calc_base_vars below? No, need to add it.
-        # But wait, mining A1/A2 accessed `bar.sentiment`.
-        st = (
-            self.prev_bar_tgt.sentiment if self.prev_bar_tgt else 0
-        )  # Wait current or prev? Current.
-        # But this func doesn't take 'bar' input.
-        # I should have passed raw data in vars.
-        # Hack: Pass it.
+        # (17) 资金流比率 (Flow Ratio)
+        # 需要原始情绪值。在此函数中通过 hack 获取 (此处实际上应由 wrapper 传入)
+        st = self.prev_bar_tgt.sentiment if self.prev_bar_tgt else 0
 
         # (18) Co-Imbalance Sync
         # Corr(iOFI_aux, iOFI_tgt)
@@ -827,22 +819,21 @@ class WhiteBoxFeatureFactory:
 
     def _mining_A4_wrapper(self, a1_t, a1_a, a2_t, a2_a, vars_t, vars_a, avail):
         """
-        Helper to access computed features for A4
+        A4 特征计算辅助函数 (访问已计算的特征)
         """
         if not avail:
             return self._mining_A4_cross(vars_t, vars_a, False)  # Returns 0s
 
         f = self._mining_A4_cross(vars_t, vars_a, True)
 
-        # (17) Flow Ratio
-        # Need sentiment. Assuming it was in vars?
-        # I'll update `_calc_base_vars` to include sentiment.
+        # (17) 资金流比率 (Flow Ratio)
+        # 使用来自 vars 的 sentiment
         s_t = vars_t.get("sentiment", 0)
         s_a = vars_a.get("sentiment", 0)
         f["flow_ratio"] = s_a / (abs(s_t) + EPS)
 
         # (18) Co-Imbalance Sync
-        # iOFI from A1 output
+        # 使用 A1 输出的 iOFI
         iofi_t = a1_t.get("iOFI", 0)
         iofi_a = a1_a.get("iOFI", 0)
 
@@ -853,7 +844,7 @@ class WhiteBoxFeatureFactory:
 
         return f
 
-    # Redefine base vars to include sentiment
+    # 重定义基础变量以包含 sentiment
     def _calc_base_vars(self, bar: Bar, prev: Optional[Bar]) -> Dict:
         bn = (
             super()._calc_base_vars(bar, prev)
@@ -864,7 +855,7 @@ class WhiteBoxFeatureFactory:
         return bn
 
     def _calc_base_vars_orig(self, bar: Bar, prev: Optional[Bar]) -> Dict:
-        # Copy of original logic to make it self-contained
+        # 原始逻辑副本 (使其自包含)
         bp1 = bar.bids[0][0] if bar.bids else 0
         sp1 = bar.asks[0][0] if bar.asks else 0
         mid = (bp1 + sp1) / 2 if (bp1 > 0 and sp1 > 0) else 0
@@ -892,7 +883,7 @@ class WhiteBoxFeatureFactory:
             "sentiment": bar.sentiment,
         }
 
-    # Override Compute to wire A4 Wrapper
+    # 重写 Compute 以连接 A4 Wrapper
     def compute(self, sample: AlignedSample) -> Dict:
         masks = {
             "aux_available": 1.0 if sample.aux_available else 0.0,

@@ -8,18 +8,21 @@ import pandas as pd  # Added missing import
 sys.path.append(os.getcwd())
 
 # 导入整合后的模块
-from hsi_hft_v3.data_layer import V5DataLoader
-from hsi_hft_v3.trading_layer import (
+# 导入整合后的模块
+from hsi_hft_v3.model.data_layer import V5DataLoader
+from hsi_hft_v3.config import (
     TARGET_SYMBOL,
     AUX_SYMBOL,
     PolicyConfig,
     BLACKBOX_DIM,
+)
+from hsi_hft_v3.model.trading_layer import (
     StateMachine,
     BacktestEngine,
     calculate_metrics,
 )
-from hsi_hft_v3.model_layer import DeepFactorMinerV5, ResidualCombine
-from hsi_hft_v3.features.whitebox import WhiteBoxFeatureFactory
+from hsi_hft_v3.model.model_layer import DeepFactorMinerV5, ResidualCombine
+from hsi_hft_v3.model.whitebox import WhiteBoxFeatureFactory
 
 
 def main():
@@ -207,25 +210,13 @@ def main():
                 # Warming up
                 model_outputs.append({"p_hit": 0.0, "risk": 0.0, "P_tau_le_60s": 0.0})
 
-    # 5. Policy Execution
-    print(f"[Prod] Generated {len(model_outputs)} signals. Executing Strategy...")
+    # 5. 策略执行
+    print(f"[Prod] 生成了 {len(model_outputs)} 个信号。正在执行策略...")
     policy = StateMachine(PolicyConfig())
     engine = BacktestEngine(policy)
 
-    # Run loop needs modification to unpack white_risk from model_outputs
-    # Engine.run expects list of dicts.
-    # But Engine.run logic separates model_out and white_risk?
-    # Engine.run() implementation:
-    #   model_out = model_outputs[i]
-    #   white_risk = {"spread_bps": 5.0} ... HARDCODED there.
-    # We must fix Engine loop too?
-    # Actually Engine is external. We should modify Engine to accept white_risk in input or
-    # extract it from model_outputs if we bundled it there.
-    # Let's modify BacktestEngine.run to look for 'white_risk' in model_outputs or
-    # pass a separate list.
-    # Easier: Engine.run takes models_outputs. We bundled 'white_risk' into it above.
-    # So we just update Engine.run to read it.
-
+    # 引擎会自动从 model_outputs[i] 中读取 'white_risk' 字段
+    # 并将其传递给 policy.decide()
     engine.run(samples, model_outputs)
 
     # 6. Metrics
